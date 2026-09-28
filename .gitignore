@@ -1,0 +1,13 @@
+*.iml
+.gradle/
+.Clairvoyance/
+.idea/
+local.properties
+.DS_Store
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+app/src/main/python/**/__pycache__/
