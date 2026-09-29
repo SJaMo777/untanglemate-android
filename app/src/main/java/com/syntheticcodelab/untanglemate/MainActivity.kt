@@ -8,9 +8,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.Arrangement
@@ -52,6 +52,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.isSecondaryPressed
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -64,6 +65,7 @@ import com.chaquo.python.android.AndroidPlatform
 import org.json.JSONObject
 import java.io.File
 import kotlin.math.roundToInt
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** One node in the tree, as parsed from android_bridge's JSON. x/y come
  * from the exact same core.layout algorithm Windows uses (see the bridge
@@ -606,6 +608,11 @@ private fun MindMapCanvas(
     var contextMenuNode by remember { mutableStateOf<MapNode?>(null) }
     var contextMenuScreenPos by remember { mutableStateOf(Offset.Zero) }
 
+    // Selection is pure display state — a single tap just marks a node as
+    // selected (a highlight ring); it doesn't touch the model at all, so
+    // it lives here rather than round-tripping through the bridge.
+    var selectedNodeId by remember { mutableStateOf<String?>(null) }
+
     val visible = remember(root, expanded) {
         val out = mutableListOf<VisibleNode>()
         computeVisible(root, null, expanded, { text ->
@@ -664,76 +671,126 @@ private fun MindMapCanvas(
                     }
                 }
             }
-            .pointerInput(visible, scale, offset) {
-                // Shared by both gestures: the same screen-to-world inverse
-                // of the transform drawing applies below (translate to
-                // center + pan, then scale), so tap and double-tap can
-                // never disagree about which node they landed on.
-                fun hitTest(screenOffset: Offset): VisibleNode? {
-                    val world = worldPoint(screenOffset, size)
-                    return visible.lastOrNull { it.rect.contains(world) }
-                }
-                detectTapGestures(
-                    onTap = { tapOffset ->
-                        val hit = hitTest(tapOffset)
-                        if (hit != null && hit.node.children.isNotEmpty()) {
-                            onToggle(hit.node.id)
-                        }
-                    },
-                    onDoubleTap = { tapOffset ->
-                        hitTest(tapOffset)?.let { onOpenActions(it.node) }
-                    },
-                )
-            }
+            // One hand-rolled detector covers the whole touch gesture set,
+            // since Compose's built-in detectTapGestures only distinguishes
+            // single vs. double tap and can't express "third tap" or "tap,
+            // then hold" on its own:
+            //   1 tap            -> select (a highlight ring, display only)
+            //   2 taps           -> toggle expand/collapse
+            //   3 taps           -> edit name (opens the same dialog as
+            //                       the touch-context-menu's "Rename/Style…")
+            //   hold from cold   -> drag to move/reparent
+            //   tap, then hold   -> the touch equivalent of a mouse
+            //                       right-click: the same context menu
             .pointerInput(visible, scale, offset, root) {
                 fun hitTest(screenOffset: Offset): VisibleNode? {
                     val world = worldPoint(screenOffset, size)
                     return visible.lastOrNull { it.rect.contains(world) }
                 }
-                detectDragGesturesAfterLongPress(
-                    onDragStart = { startOffset ->
-                        val hit = hitTest(startOffset)
-                        // Root has no parent to move it out of — dragging
-                        // it would have nowhere valid to go.
-                        if (hit != null && hit.node.id != root.id) {
-                            draggingNodeId = hit.node.id
-                            dragScreenDelta = Offset.Zero
-                            dropTargetId = null
+                awaitEachGesture {
+                    var down = awaitFirstDown()
+                    // Resolved once, from the very first touch of the
+                    // cluster — later taps in the same cluster are assumed
+                    // to be hitting the same node a real finger is aiming
+                    // at, rather than re-hit-testing (and possibly
+                    // disagreeing) on every intermediate tap.
+                    val hitNode = hitTest(down.position)?.node
+                    var tapCount = 0
+                    var resolved = false
+
+                    while (!resolved) {
+                        tapCount++
+                        val up = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                            waitForUpOrCancellation()
                         }
-                    },
-                    onDrag = { change, dragAmount ->
-                        if (draggingNodeId == null) return@detectDragGesturesAfterLongPress
-                        change.consume()
-                        dragScreenDelta += dragAmount
-                        val draggedRect = visible.first { it.node.id == draggingNodeId }.rect
-                        val draggedCenterNow = draggedRect.center + dragScreenDelta / scale
-                        // A node can't be dropped onto itself or its own
-                        // descendants — computed fresh each drag update
-                        // since which node is "self" doesn't change but
-                        // this is cheap enough not to bother memoizing.
-                        val excluded = mutableSetOf<String>()
-                        visible.first { it.node.id == draggingNodeId }
-                            .let { subtreeIds(it.node, excluded) }
-                        dropTargetId = visible.lastOrNull {
-                            it.node.id !in excluded && it.rect.contains(draggedCenterNow)
-                        }?.node?.id
-                    },
-                    onDragEnd = {
-                        val nodeId = draggingNodeId
-                        val target = dropTargetId
-                        if (nodeId != null && target != null && target != nodeId) {
-                            onReparent(nodeId, target)
+
+                        if (up == null) {
+                            // Still down past the long-press threshold.
+                            if (tapCount == 1) {
+                                // Held from cold, no prior tap this cluster
+                                // -> drag to move. Root has no parent to
+                                // move it out of, so it's not draggable.
+                                if (hitNode != null && hitNode.id != root.id) {
+                                    draggingNodeId = hitNode.id
+                                    dragScreenDelta = Offset.Zero
+                                    dropTargetId = null
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val change =
+                                            event.changes.firstOrNull { it.id == down.id }
+                                                ?: break
+                                        if (!change.pressed) break
+                                        change.consume()
+                                        dragScreenDelta += change.positionChange()
+                                        val draggedRect =
+                                            visible.first { it.node.id == draggingNodeId }.rect
+                                        val draggedCenterNow =
+                                            draggedRect.center + dragScreenDelta / scale
+                                        // A node can't be dropped onto itself
+                                        // or its own descendants — computed
+                                        // fresh each move since which node is
+                                        // "self" doesn't change, but this is
+                                        // cheap enough not to bother
+                                        // memoizing.
+                                        val excluded = mutableSetOf<String>()
+                                        visible.first { it.node.id == draggingNodeId }
+                                            .let { subtreeIds(it.node, excluded) }
+                                        dropTargetId = visible.lastOrNull {
+                                            it.node.id !in excluded &&
+                                                it.rect.contains(draggedCenterNow)
+                                        }?.node?.id
+                                    }
+                                    val nodeId = draggingNodeId
+                                    val target = dropTargetId
+                                    if (nodeId != null && target != null && target != nodeId) {
+                                        onReparent(nodeId, target)
+                                    }
+                                    draggingNodeId = null
+                                    dropTargetId = null
+                                    dragScreenDelta = Offset.Zero
+                                }
+                            } else {
+                                // A tap (or two) already landed this
+                                // cluster, and now the finger is holding
+                                // instead of releasing quickly again — the
+                                // touch equivalent of a mouse right-click.
+                                contextMenuNode = hitNode
+                                contextMenuScreenPos = down.position
+                                contextMenuOpen = true
+                                // Drain the rest of this press so releasing
+                                // the finger afterward doesn't leak into
+                                // anything else.
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val change =
+                                        event.changes.firstOrNull { it.id == down.id } ?: break
+                                    change.consume()
+                                    if (!change.pressed) break
+                                }
+                            }
+                            resolved = true
+                        } else {
+                            // A clean, quick tap. Give it a moment to see if
+                            // another one follows before deciding what this
+                            // cluster means.
+                            val nextDown = withTimeoutOrNull(viewConfiguration.doubleTapTimeoutMillis) {
+                                awaitFirstDown()
+                            }
+                            if (nextDown == null || tapCount >= 3) {
+                                when (tapCount) {
+                                    1 -> selectedNodeId = hitNode?.id
+                                    2 -> hitNode?.let {
+                                        if (it.children.isNotEmpty()) onToggle(it.id)
+                                    }
+                                    else -> hitNode?.let { onOpenActions(it) }
+                                }
+                                resolved = true
+                            } else {
+                                down = nextDown
+                            }
                         }
-                        draggingNodeId = null
-                        dropTargetId = null
-                        dragScreenDelta = Offset.Zero
-                    },
-                    onDragCancel = {
-                        draggingNodeId = null
-                        dropTargetId = null
-                        dragScreenDelta = Offset.Zero
-                    },
-                )
+                    }
+                }
             },
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
@@ -799,6 +856,18 @@ private fun MindMapCanvas(
                                 size = drawRect.size,
                                 cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f),
                                 style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4f / scale),
+                            )
+                        }
+                        // A single tap just selects — display-only, no
+                        // model change — so it gets its own distinct ring
+                        // color from the drop-target green.
+                        if (v.node.id == selectedNodeId && !isDropTarget) {
+                            drawRoundRect(
+                                color = Color(0xFF1E88E5),
+                                topLeft = drawRect.topLeft,
+                                size = drawRect.size,
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f),
+                                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3f / scale),
                             )
                         }
                         // White text reads on both the purple root default
