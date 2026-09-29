@@ -10,10 +10,17 @@ Jetpack Compose UI, Chaquopy embedding a full Python 3.12 interpreter,
 `app/src/main/python/synmind/` containing the **exact same** `synmind/core/`
 files copied unmodified from the Windows repo (`untanglemate-windows`).
 
-`MainActivity` shows a read-only, expandable/collapsible tree of the
-current map (tap a node with children to expand/collapse — UI-only state,
-doesn't touch the model's own `collapsed` field yet). Two ways to get a
-map into it:
+`MainActivity` shows a real read-only visual canvas of the current map —
+nodes as boxes positioned by the exact same `core.layout.apply_layout()`
+Windows uses (root at `(0,0)`, branches fanning to both `+x`/`-x` for the
+default "tidy_branched" style, not a top-down tree), connector lines
+between parent and child, pan (drag) and tap-to-expand/collapse a node
+with children (UI-only state — doesn't touch the model's own `collapsed`
+field yet, no editing). Box sizes come from Compose's OWN text
+measurement rather than `layout.py`'s internal Qt-free size estimate, so
+positions are close to Windows's but not pixel-identical — occasional
+overlap on long text is expected at this stage, not a bug to chase yet.
+Two ways to get a map into it:
 - **"Open .smmap…"** — the real feature. Uses Android's Storage Access
   Framework (`ActivityResultContracts.OpenDocument`) to pick a file, copies
   it into the app's cache dir (Chaquopy/`core.document.load()` needs a real
@@ -206,11 +213,19 @@ not found" errors) — use `android.exe` directly, not the wrapper.
 
 - No app icon (manifest has no `android:icon`; builds fine, just shows
   a default).
-- Tree view is read-only — no editing, no writing changes back to the
-  file, no touching the model's real `collapsed` field (expand/collapse
-  in the UI is view-state only).
-- No real mind-map layout/canvas — just an indented list, nothing like
-  the Windows app's actual node graph rendering yet.
+- Canvas is read-only — no editing, no writing changes back to the file,
+  no touching the model's real `collapsed` field (expand/collapse in the
+  UI is view-state only).
+- Pinch-zoom is wired up in code (`detectTransformGestures` updates
+  `scale`) but NOT verified interactively — `adb shell input` doesn't
+  have a simple multi-touch pinch primitive, only pan (drag) was
+  actually tested this round.
+- No node styling (fill/border colors, images, badges) — every box is
+  the same two colors regardless of what the map actually stores.
 - Not tested against a REAL user map (only the small synthetic
   root+2-children+1-grandchild fixture) — large maps, aliases, and every
   other `core/` feature beyond plain parent/child text are unverified.
+  Untested at scale: `computeVisible` walks and re-measures the ENTIRE
+  expanded subtree on every recomposition with no memoization beyond the
+  `remember(root, expanded)` key — fine for a handful of nodes, likely
+  needs work before trying a map with hundreds.
