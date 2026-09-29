@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -27,6 +28,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
@@ -428,6 +430,79 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                             }
+
+                            // The icon toolbar Windows calls its "Menu Bar"
+                            // (menu_bar.py's CustomMenuBar, grouped dark
+                            // icon frames below the text File/Edit/View/…
+                            // bar). Windows's version is a large, per-map
+                            // customizable toolbar with dozens of buttons
+                            // for features (attachments, tags, priorities,
+                            // layout recall…) that don't exist here yet —
+                            // this mirrors its grouped-icon-frame LOOK using
+                            // only the functions this app actually has, the
+                            // same actions as the File/Edit dropdowns above,
+                            // just one tap away instead of two.
+                            val selectedNode = selectedNodeId?.let { findMapNode(root, it) }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 8.dp)
+                                    .background(Color(0xFF2B2B2B), RoundedCornerShape(8.dp))
+                                    .padding(8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            ) {
+                                ToolbarGroup("History") {
+                                    ToolbarIconButton("↺", enabled = canUndo) {
+                                        applyMutation(bridge.callAttr("undo").toString())
+                                    }
+                                    ToolbarIconButton("↻", enabled = canRedo) {
+                                        applyMutation(bridge.callAttr("redo").toString())
+                                    }
+                                }
+                                ToolbarGroup("File") {
+                                    ToolbarIconButton("📂") { openDocument.launch(arrayOf("*/*")) }
+                                    ToolbarIconButton("💾") { saveCurrentMap() }
+                                }
+                                ToolbarGroup("Node Actions") {
+                                    ToolbarIconButton("➕") {
+                                        val targetId = selectedNodeId ?: root.id
+                                        val json = JSONObject(
+                                            bridge.callAttr("add_child", targetId, "New Node").toString()
+                                        )
+                                        applyMutation(json.toString())
+                                    }
+                                    ToolbarIconButton("✏", enabled = selectedNode != null) {
+                                        selectedNode?.let { actionTarget = it }
+                                    }
+                                    ToolbarIconButton(
+                                        "📤",
+                                        enabled = selectedNode != null && selectedNode.id != root.id,
+                                    ) {
+                                        selectedNode?.let { moveTarget = it }
+                                    }
+                                    ToolbarIconButton(
+                                        "🗑",
+                                        enabled = selectedNode != null && selectedNode.id != root.id,
+                                    ) {
+                                        selectedNode?.let {
+                                            applyMutation(bridge.callAttr("delete_node", it.id).toString())
+                                            selectedNodeId = null
+                                        }
+                                    }
+                                    ToolbarIconButton(
+                                        "▦",
+                                        enabled = selectedNode != null && selectedNode.children.isNotEmpty(),
+                                    ) {
+                                        selectedNode?.let { node ->
+                                            expanded.value = if (node.id in expanded.value) {
+                                                expanded.value - node.id
+                                            } else {
+                                                expanded.value + node.id
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         MindMapCanvas(
                             root = root,
@@ -622,6 +697,51 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+}
+
+/** One labeled, framed cluster of icon buttons — the Android equivalent of
+ * a group frame in Windows's CustomMenuBar (menu_bar.py), which paints a
+ * small caption above a dark rounded frame of QToolButtons. */
+@androidx.compose.runtime.Composable
+private fun ToolbarGroup(
+    title: String,
+    content: @androidx.compose.runtime.Composable RowScope.() -> Unit,
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            title,
+            style = MaterialTheme.typography.labelSmall,
+            color = Color(0xFFAAAAAA),
+        )
+        Row(
+            modifier = Modifier
+                .padding(top = 2.dp)
+                .background(Color(0xFF3A3A3A), RoundedCornerShape(6.dp))
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            content = content,
+        )
+    }
+}
+
+/** One icon button on the toolbar. Plain glyph text rather than a Material
+ * icon font — this project has no material-icons-extended dependency, and
+ * the Windows bar itself is emoji glyphs (see menu_bar.py's own header
+ * comment on `_MB_GLYPH_PX`), so a Unicode glyph is the closer match
+ * anyway. */
+@androidx.compose.runtime.Composable
+private fun ToolbarIconButton(glyph: String, enabled: Boolean = true, onClick: () -> Unit) {
+    androidx.compose.material3.IconButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = Modifier.size(36.dp),
+    ) {
+        Text(
+            glyph,
+            fontSize = 18.sp,
+            color = if (enabled) Color.White else Color(0xFF6E6E6E),
+        )
     }
 }
 
