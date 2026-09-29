@@ -610,28 +610,23 @@ class MainActivity : ComponentActivity() {
                                 )
                             },
                             // Right-click (mouse secondary button) or tap-
-                            // then-hold (touch) context menu — quick versions
-                            // of the same actions the full "Node" dialog
-                            // offers.
-                            onQuickAddChild = { node ->
+                            // then-hold (touch) on a node opens the same
+                            // full "Node" dialog as triple-tap (onOpenActions
+                            // above) — a custom quick-menu popup used to
+                            // live here instead, but its items weren't
+                            // reliably clickable in every environment
+                            // (arrow-key navigation worked, direct clicks on
+                            // items didn't), so this reuses the dialog
+                            // that's already proven reliable everywhere.
+                            // Right-click/hold on EMPTY canvas has no node
+                            // to open a dialog for, so it just performs its
+                            // one possible action directly.
+                            onAddChildToRoot = {
                                 val json = JSONObject(
-                                    bridge.callAttr("add_child", node.id, "New Node").toString()
+                                    bridge.callAttr("add_child", root.id, "New Node").toString()
                                 )
                                 applyMutation(json.toString())
                             },
-                            onQuickDelete = { node ->
-                                applyMutation(bridge.callAttr("delete_node", node.id).toString())
-                                if (selectedNodeId == node.id) selectedNodeId = null
-                            },
-                            onMoveRequest = { node -> moveTarget = node },
-                            onToggleTodo = { node ->
-                                applyMutation(
-                                    bridge.callAttr(
-                                        "set_todo", node.id, !node.todoMarked, node.todoDueAt,
-                                    ).toString()
-                                )
-                            },
-                            onSetDueDate = { node -> dueDateTarget = node },
                             // Hoisted so the header's Edit menu (outside the
                             // canvas) can see and act on the same selection
                             // a tap sets.
@@ -1015,11 +1010,7 @@ private fun MindMapCanvas(
     // gesture start, so one of them had to move).
     onOpenActions: (MapNode) -> Unit,
     onReparent: (nodeId: String, newParentId: String) -> Unit,
-    onQuickAddChild: (MapNode) -> Unit,
-    onQuickDelete: (MapNode) -> Unit,
-    onMoveRequest: (MapNode) -> Unit,
-    onToggleTodo: (MapNode) -> Unit,
-    onSetDueDate: (MapNode) -> Unit,
+    onAddChildToRoot: () -> Unit,
     selectedNodeId: String?,
     onSelect: (String?) -> Unit,
 ) {
@@ -1035,13 +1026,6 @@ private fun MindMapCanvas(
     var draggingNodeId by remember { mutableStateOf<String?>(null) }
     var dragScreenDelta by remember { mutableStateOf(Offset.Zero) }
     var dropTargetId by remember { mutableStateOf<String?>(null) }
-
-    // Right-click context menu state. contextMenuNode == null && contextMenuOpen
-    // means "right-clicked empty space" (a menu with canvas-level actions);
-    // contextMenuNode != null means "right-clicked this node".
-    var contextMenuOpen by remember { mutableStateOf(false) }
-    var contextMenuNode by remember { mutableStateOf<MapNode?>(null) }
-    var contextMenuScreenPos by remember { mutableStateOf(Offset.Zero) }
 
     val visible = remember(root, expanded) {
         val out = mutableListOf<VisibleNode>()
@@ -1081,9 +1065,8 @@ private fun MindMapCanvas(
                     val event = awaitPointerEvent(PointerEventPass.Initial)
                     if (event.type == PointerEventType.Press && event.buttons.isSecondaryPressed) {
                         val position = event.changes.first().position
-                        contextMenuNode = hitTest(position)?.node
-                        contextMenuScreenPos = position
-                        contextMenuOpen = true
+                        val hit = hitTest(position)?.node
+                        if (hit != null) onOpenActions(hit) else onAddChildToRoot()
                         event.changes.forEach { it.consume() }
                     }
                 }
@@ -1184,9 +1167,7 @@ private fun MindMapCanvas(
                                 // cluster, and now the finger is holding
                                 // instead of releasing quickly again — the
                                 // touch equivalent of a mouse right-click.
-                                contextMenuNode = hitNode
-                                contextMenuScreenPos = down.position
-                                contextMenuOpen = true
+                                if (hitNode != null) onOpenActions(hitNode) else onAddChildToRoot()
                                 // Drain the rest of this press so releasing
                                 // the finger afterward doesn't leak into
                                 // anything else.
@@ -1320,67 +1301,5 @@ private fun MindMapCanvas(
             }
         }
 
-        // The right-click context menu itself. Anchored to a zero-size Box
-        // positioned at the exact screen point the click happened, rather
-        // than at a node's own layout position — a right-click on empty
-        // space has no node to anchor to, and this way both cases (hit a
-        // node vs. hit nothing) share one anchor strategy.
-        if (contextMenuOpen) {
-            Box(
-                modifier = Modifier.offset {
-                    IntOffset(contextMenuScreenPos.x.roundToInt(), contextMenuScreenPos.y.roundToInt())
-                },
-            ) {
-                DropdownMenu(
-                    expanded = true,
-                    onDismissRequest = { contextMenuOpen = false },
-                ) {
-                    val node = contextMenuNode
-                    if (node != null) {
-                        DropdownMenuItem(
-                            text = { Text("Add Child") },
-                            onClick = { contextMenuOpen = false; onQuickAddChild(node) },
-                        )
-                        if (node.id != root.id) {
-                            DropdownMenuItem(
-                                text = { Text("Move to…") },
-                                onClick = { contextMenuOpen = false; onMoveRequest(node) },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
-                                onClick = { contextMenuOpen = false; onQuickDelete(node) },
-                            )
-                        }
-                        DropdownMenuItem(
-                            text = { Text("Rename / Style…") },
-                            onClick = { contextMenuOpen = false; onOpenActions(node) },
-                        )
-                        HorizontalDivider()
-                        // Matches Windows's own node right-click menu,
-                        // which has a "Mark as ToDo" / "Unmark as ToDo"
-                        // toggle plus a due-date item in its ToDo/Schedule
-                        // submenus (see node_item.py's
-                        // _show_node_context_menu_impl) — this was the one
-                        // node action reachable from the Edit menu and
-                        // toolbar but missing from here.
-                        DropdownMenuItem(
-                            text = { Text(if (node.todoMarked) "Unmark as ToDo" else "Mark as ToDo") },
-                            onClick = { contextMenuOpen = false; onToggleTodo(node) },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("Set Due Date…") },
-                            onClick = { contextMenuOpen = false; onSetDueDate(node) },
-                        )
-                    } else {
-                        // Right-clicked empty space — the one canvas-level
-                        // action that makes sense without a target node.
-                        DropdownMenuItem(
-                            text = { Text("Add Child to Root") },
-                            onClick = { contextMenuOpen = false; onQuickAddChild(root) },
-                        )
-                    }
-                }
-            }
-        }
     }
 }
