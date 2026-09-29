@@ -98,6 +98,11 @@ data class MapNode(
     // list needs; todo_priority/todo_recurrence have no Android UI yet.
     val todoMarked: Boolean,
     val todoDueAt: String?,
+    // 1 (most urgent) .. 5 (least), or null — node_item.py's general
+    // priority_level badge, independent of todo_priority.
+    val priorityLevel: Int?,
+    // node_item.py's amber "T" badge — this node names its subtree.
+    val isTopic: Boolean,
     val children: List<MapNode>,
 )
 
@@ -140,6 +145,8 @@ private fun parseNode(obj: JSONObject): MapNode {
         borderColor = parseHexColor(if (obj.isNull("borderColor")) null else obj.getString("borderColor")),
         todoMarked = obj.optBoolean("todoMarked", false),
         todoDueAt = if (obj.isNull("todoDueAt")) null else obj.getString("todoDueAt"),
+        priorityLevel = if (obj.isNull("priorityLevel")) null else obj.getInt("priorityLevel"),
+        isTopic = obj.optBoolean("isTopic", false),
         children = children,
     )
 }
@@ -751,6 +758,65 @@ class MainActivity : ComponentActivity() {
                                         dueDateTarget = target
                                         actionTarget = null
                                     }) { Text("Set Due Date…") }
+                                }
+                                // Priority (1 = most urgent .. 5 = least),
+                                // same color scale as priority_panel.py's
+                                // _PRIORITY_COLOR, via the real
+                                // SetPriorityLevelCommand (undo-capable).
+                                Row(
+                                    modifier = Modifier.padding(top = 12.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    val priorityColors = mapOf(
+                                        1 to Color(0xFFEF4444), 2 to Color(0xFFF97316),
+                                        3 to Color(0xFFEAB308), 4 to Color(0xFF84CC16),
+                                        5 to Color(0xFF3B82F6),
+                                    )
+                                    for ((level, levelColor) in priorityColors) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .background(levelColor, CircleShape)
+                                                .border(
+                                                    if (target.priorityLevel == level) 3.dp else 1.dp,
+                                                    Color.Black,
+                                                    CircleShape,
+                                                )
+                                                .clickable {
+                                                    applyMutation(
+                                                        bridge.callAttr("set_priority", target.id, level).toString()
+                                                    )
+                                                    actionTarget = null
+                                                },
+                                            contentAlignment = Alignment.Center,
+                                        ) { Text("$level", color = Color.White) }
+                                    }
+                                    Box(
+                                        modifier = Modifier
+                                            .size(32.dp)
+                                            .border(1.dp, Color.Black, CircleShape)
+                                            .clickable {
+                                                applyMutation(
+                                                    bridge.callAttr("set_priority", target.id, null).toString()
+                                                )
+                                                actionTarget = null
+                                            },
+                                        contentAlignment = Alignment.Center,
+                                    ) { Text("×") }
+                                }
+                                // Topic — amber "T" badge, direct mutation
+                                // (no undo), matching Windows's own
+                                // toggle_topic_on_selected(): "topic marks
+                                // are presentation metadata, like
+                                // bookmark/view-lock".
+                                TextButton(
+                                    onClick = {
+                                        applyMutation(bridge.callAttr("toggle_topic", target.id).toString())
+                                        actionTarget = null
+                                    },
+                                    modifier = Modifier.padding(top = 4.dp),
+                                ) {
+                                    Text(if (target.isTopic) "Unmark as Topic" else "Mark as Topic")
                                 }
                             }
                         },
@@ -1425,6 +1491,75 @@ private fun MindMapCanvas(
                             ),
                             style = textStyle.copy(color = textColor),
                         )
+                        // Status badges — a row of small circles centered
+                        // below the box (Windows's node_item.py has a
+                        // "below" badge layout mode alongside its default
+                        // beside-the-box one; that's the one that doesn't
+                        // need the box itself measured wider to fit them).
+                        // Same colors/glyphs as Windows: ToDo blue/red "D",
+                        // priority 1-5 color-graded number, topic amber "T".
+                        val badges = buildList {
+                            if (v.node.todoMarked) {
+                                val overdue = v.node.todoDueAt?.let {
+                                    runCatching { LocalDate.parse(it) < LocalDate.now() }.getOrDefault(false)
+                                } ?: false
+                                add(
+                                    Triple(
+                                        if (overdue) Color(0xFFEF4444) else Color(0xFF3B82F6),
+                                        if (overdue) Color(0xFF7F1D1D) else Color(0xFF1E3A8A),
+                                        "D" to Color.White,
+                                    )
+                                )
+                            }
+                            v.node.priorityLevel?.let { level ->
+                                val col = when (level) {
+                                    1 -> Color(0xFFEF4444)
+                                    2 -> Color(0xFFF97316)
+                                    3 -> Color(0xFFEAB308)
+                                    4 -> Color(0xFF84CC16)
+                                    5 -> Color(0xFF3B82F6)
+                                    else -> Color(0xFF9CA3AF)
+                                }
+                                add(Triple(col, Color(0xFF1F2937), level.toString() to Color.White))
+                            }
+                            if (v.node.isTopic) {
+                                add(Triple(Color(0xFFF59E0B), Color(0xFF7C2D12), "T" to Color(0xFF1F2937)))
+                            }
+                        }
+                        if (badges.isNotEmpty()) {
+                            val badgeRadius = 11f
+                            val badgeGap = 6f
+                            val totalWidth = badges.size * (badgeRadius * 2) + (badges.size - 1) * badgeGap
+                            var bx = drawRect.left + drawRect.width / 2f - totalWidth / 2f + badgeRadius
+                            val by = drawRect.bottom + badgeGap + badgeRadius
+                            for ((fillColor, strokeColor, labelAndColor) in badges) {
+                                val (label, labelColor) = labelAndColor
+                                val center = Offset(bx, by)
+                                drawCircle(color = fillColor, radius = badgeRadius, center = center)
+                                drawCircle(
+                                    color = strokeColor,
+                                    radius = badgeRadius,
+                                    center = center,
+                                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5f),
+                                )
+                                val badgeStyle = TextStyle(
+                                    fontSize = 11.sp,
+                                    color = labelColor,
+                                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                                )
+                                val measured = textMeasurer.measure(label, badgeStyle)
+                                drawText(
+                                    textMeasurer = textMeasurer,
+                                    text = label,
+                                    topLeft = Offset(
+                                        bx - measured.size.width / 2f,
+                                        by - measured.size.height / 2f,
+                                    ),
+                                    style = badgeStyle,
+                                )
+                                bx += badgeRadius * 2 + badgeGap
+                            }
+                        }
                     }
                 }
             }

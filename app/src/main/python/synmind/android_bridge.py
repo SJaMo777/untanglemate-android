@@ -41,6 +41,7 @@ from synmind.core.commands import (
     ReparentNodeCommand,
     SetBorderColorCommand,
     SetFillColorCommand,
+    SetPriorityLevelCommand,
     SetTodoStateCommand,
 )
 from synmind.core.history import History
@@ -74,6 +75,12 @@ def _node_to_dict(node: Node) -> dict:
         # have no Android UI yet.
         "todoMarked": node.todo_marked,
         "todoDueAt": node.todo_due_at,
+        # The node-box badges (see node_item.py's ToDo/priority/topic
+        # painting): priority_level is the general 1-5 urgency label
+        # (independent of todo_priority, which stays Windows-only), and
+        # is_topic marks this node as naming the subject of its subtree.
+        "priorityLevel": node.priority_level,
+        "isTopic": node.is_topic,
         "children": [_node_to_dict(c) for c in node.children],
     }
 
@@ -289,6 +296,34 @@ def list_todos() -> str:
     walk(_current.root)
     out.sort(key=lambda t: (t["dueAt"] is None, t["dueAt"] or ""))
     return json.dumps(out)
+
+
+def set_priority(node_id: str, level: int | None) -> str:
+    """1-5 (1 = most urgent, matching the color scale priority_panel.py's
+    _PRIORITY_COLOR uses: red/orange/yellow/lime/blue) or null to clear,
+    via the real SetPriorityLevelCommand/History (undo-capable)."""
+    global _dirty
+    node = _current.find(node_id)
+    if node is None:
+        raise ValueError("No such node: %s" % node_id)
+    _execute(SetPriorityLevelCommand(node_id=node_id, new_level=level))
+    _dirty = True
+    return _map_to_json(_current)
+
+
+def toggle_topic(node_id: str) -> str:
+    """Flips is_topic on the given node — a direct mutation, not run
+    through History, deliberately matching Windows's own
+    toggle_topic_on_selected() (see its docstring: "topic marks are
+    presentation metadata, like bookmark/view-lock" — not an undoable
+    edit to the map's content)."""
+    global _dirty
+    node = _current.find(node_id)
+    if node is None:
+        raise ValueError("No such node: %s" % node_id)
+    node.is_topic = not node.is_topic
+    _dirty = True
+    return _map_to_json(_current)
 
 
 def undo() -> str:
