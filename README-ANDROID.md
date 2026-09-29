@@ -10,14 +10,30 @@ Jetpack Compose UI, Chaquopy embedding a full Python 3.12 interpreter,
 `app/src/main/python/synmind/` containing the **exact same** `synmind/core/`
 files copied unmodified from the Windows repo (`untanglemate-windows`).
 
-`MainActivity` shows a real read-only visual canvas of the current map —
-nodes as boxes positioned by the exact same `core.layout.apply_layout()`
-Windows uses (root at `(0,0)`, branches fanning to both `+x`/`-x` for the
-default "tidy_branched" style, not a top-down tree), connector lines
-between parent and child, pan (drag), pinch-zoom (wired up, not yet
-interactively verified — see below), and tap-to-expand/collapse a node
-with children (UI-only state — doesn't touch the model's own `collapsed`
-field yet, no editing).
+`MainActivity` shows a real visual canvas of the current map — nodes as
+boxes positioned by the exact same `core.layout.apply_layout()` Windows
+uses (root at `(0,0)`, branches fanning to both `+x`/`-x` for the default
+"tidy_branched" style, not a top-down tree), connector lines between
+parent and child, pan (drag), pinch-zoom (wired up, not yet interactively
+verified — see below), tap-to-expand/collapse a node with children
+(UI-only state — doesn't touch the model's own `collapsed` field), and
+now real editing: **long-press a node → rename it**. This goes through
+`core.commands.EditTextCommand` via `core.history.History` (kept as
+module state in `android_bridge._history`) — a real, undo-capable edit
+exactly like Windows's own rename, not a raw `node.text = ...`
+mutation — then re-measures/re-lays-out the same way as a fresh load,
+since the new text likely changed that node's own box size.
+
+**Save** writes through `core.document.save()` (the same Fernet-encrypted
+format, `write_history=False` since there's nowhere for Windows's
+node-history sidecar file to go from a single `content://` write) to
+whichever of these is set: the URI from "Open .smmap…", the fixed debug
+path from "Load test map", or — if neither (a never-opened default
+map) — falls back to `ActivityResultContracts.CreateDocument` for a real
+Save As. Verified end to end on-device: renamed a node, saved, pulled the
+resulting file, and loaded it back through the UNMODIFIED Windows
+`document.load()` — the new text round-tripped correctly through real
+Fernet encryption.
 
 Getting a map's layout right needed a TWO-STEP handshake with
 `android_bridge.py`, not one call — see that module's own comment for
@@ -240,9 +256,14 @@ not found" errors) — use `android.exe` directly, not the wrapper.
 
 - No app icon (manifest has no `android:icon`; builds fine, just shows
   a default).
-- Canvas is read-only — no editing, no writing changes back to the file,
-  no touching the model's real `collapsed` field (expand/collapse in the
-  UI is view-state only).
+- Only renaming is implemented — no add/delete/move/reparent a node yet,
+  and expand/collapse is still UI-only (doesn't touch the model's real
+  `collapsed` field). No undo/redo UI either, though `android_bridge`
+  already exposes `undo()`/`redo()`/`can_undo()`/`can_redo()` — wiring
+  buttons up is the next small step, not a new design.
+- Save has no dirty-tracking or "unsaved changes" indicator — it always
+  writes, and there's no warning before navigating away from an edited,
+  unsaved map.
 - Pinch-zoom is wired up in code (`detectTransformGestures` updates
   `scale`) but NOT verified interactively — `adb shell input` doesn't
   have a simple multi-touch pinch primitive, only pan (drag) was

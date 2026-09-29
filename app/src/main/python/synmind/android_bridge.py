@@ -34,9 +34,12 @@ from __future__ import annotations
 import json
 
 from synmind.core import document, layout
+from synmind.core.commands import EditTextCommand
+from synmind.core.history import History
 from synmind.core.model import MindMap, Node
 
 _current: MindMap | None = None
+_history: History | None = None
 
 
 def _node_to_dict(node: Node) -> dict:
@@ -60,8 +63,9 @@ def _map_to_json(mind_map: MindMap) -> str:
 def new_map_structure() -> str:
     """A fresh, empty map — what the app shows before anything is opened.
     Not laid out yet; call apply_measured_layout() next."""
-    global _current
+    global _current, _history
     _current = MindMap()
+    _history = History(_current)
     return _map_to_json(_current)
 
 
@@ -69,8 +73,9 @@ def open_map_structure(path: str) -> str:
     """Load a real .smmap file (already copied to a local path — Chaquopy/
     core.document need a real filesystem path, not a content:// URI).
     Not laid out yet; call apply_measured_layout() next."""
-    global _current
+    global _current, _history
     _current = document.load(path)
+    _history = History(_current)
     return _map_to_json(_current)
 
 
@@ -92,3 +97,61 @@ def apply_measured_layout(sizes_json: str) -> str:
     }
     layout.apply_layout(_current)
     return _map_to_json(_current)
+
+
+def _require_history() -> History:
+    if _current is None or _history is None:
+        raise RuntimeError(
+            "rename_node/undo/redo called before new_map_structure/"
+            "open_map_structure")
+    return _history
+
+
+def rename_node(node_id: str, new_text: str) -> str:
+    """Renames through the real EditTextCommand/History (undo-capable,
+    updates node.updated_at) rather than mutating node.text directly —
+    the same path Windows's own rename goes through. Returns the
+    structure shape again (x/y stale from the old text's size); caller
+    must re-measure and call apply_measured_layout, same as after
+    *_structure()."""
+    history = _require_history()
+    node = _current.find(node_id)
+    if node is None:
+        raise ValueError("No such node: %s" % node_id)
+    history.execute(EditTextCommand(
+        node_id=node_id, old_text=node.text, new_text=new_text))
+    return _map_to_json(_current)
+
+
+def undo() -> str:
+    _require_history().undo()
+    return _map_to_json(_current)
+
+
+def redo() -> str:
+    _require_history().redo()
+    return _map_to_json(_current)
+
+
+def can_undo() -> bool:
+    return _require_history().can_undo()
+
+
+def can_redo() -> bool:
+    return _require_history().can_redo()
+
+
+def save_map(path: str) -> None:
+    """Writes the current map to a real filesystem path in the same
+    Fernet-encrypted format Windows reads/writes (core.file_format,
+    unmodified). Caller is responsible for getting those bytes to their
+    real destination — a content:// URI (SAF) can't be written directly
+    from core.document.save(), which does its own Path(path).write_bytes()."""
+    if _current is None:
+        raise RuntimeError("save_map called before a map was loaded/created")
+    # write_history=False: the node-history sidecar Windows writes
+    # alongside a save has nowhere to go from here (we only copy the
+    # single .smmap file's bytes back to a content:// URI, not a
+    # sidecar file next to it), so skip generating one rather than
+    # leave an orphaned file behind in the app's cache dir.
+    document.save(_current, path, write_history=False)

@@ -16,10 +16,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -112,6 +115,17 @@ class MainActivity : ComponentActivity() {
             // done yet, no editing, this screen only reads).
             val expanded = remember { mutableStateOf(setOf(root.id)) }
 
+            // Where "Save" writes back to. At most one of these is set:
+            // a real "Open .smmap…" sets currentUri (content:// — needs
+            // ContentResolver, not a plain path); the debug "Load test
+            // map" shortcut sets currentDebugPath instead, since it
+            // already has a real filesystem path with nothing to resolve.
+            // Neither set (a fresh, never-opened map) means Save must
+            // fall back to Save As.
+            var currentUri by remember { mutableStateOf<Uri?>(null) }
+            var currentDebugPath by remember { mutableStateOf<String?>(null) }
+            var renameTarget by remember { mutableStateOf<MapNode?>(null) }
+
             fun loadFromPath(path: String) {
                 val structureJson = bridge.callAttr("open_map_structure", path).toString()
                 // Title doesn't need measuring — read it straight off the
@@ -134,6 +148,36 @@ class MainActivity : ComponentActivity() {
                     local.outputStream().use { output -> input.copyTo(output) }
                 }
                 loadFromPath(local.absolutePath)
+                currentUri = uri
+                currentDebugPath = null
+            }
+
+            fun writeSaveTo(uri: Uri) {
+                val local = File(cacheDir, "saving.smmap")
+                bridge.callAttr("save_map", local.absolutePath)
+                contentResolver.openOutputStream(uri, "wt")?.use { output ->
+                    local.inputStream().use { input -> input.copyTo(output) }
+                }
+            }
+
+            val createDocument = rememberLauncherForActivityResult(
+                ActivityResultContracts.CreateDocument("application/octet-stream")
+            ) { uri: Uri? ->
+                if (uri == null) return@rememberLauncherForActivityResult
+                writeSaveTo(uri)
+                currentUri = uri
+                currentDebugPath = null
+            }
+
+            fun saveCurrentMap() {
+                val uri = currentUri
+                val debugPath = currentDebugPath
+                when {
+                    uri != null -> writeSaveTo(uri)
+                    debugPath != null -> bridge.callAttr("save_map", debugPath)
+                    // Never opened/saved before — nowhere to write to yet.
+                    else -> createDocument.launch("Untitled.smmap")
+                }
             }
 
             MaterialTheme {
@@ -148,6 +192,9 @@ class MainActivity : ComponentActivity() {
                                 Button(onClick = { openDocument.launch(arrayOf("*/*")) }) {
                                     Text("Open .smmap…")
                                 }
+                                Button(onClick = { saveCurrentMap() }) {
+                                    Text("Save")
+                                }
                                 if (BuildConfig.DEBUG) {
                                     // Dev-only: sidesteps the system file
                                     // picker's UI for adb-driven testing.
@@ -161,6 +208,8 @@ class MainActivity : ComponentActivity() {
                                     Button(onClick = {
                                         val f = File(getExternalFilesDir(null), "test.smmap")
                                         loadFromPath(f.absolutePath)
+                                        currentDebugPath = f.absolutePath
+                                        currentUri = null
                                     }) {
                                         Text("Load test map")
                                     }
@@ -178,8 +227,39 @@ class MainActivity : ComponentActivity() {
                                     expanded.value + id
                                 }
                             },
+                            onLongPress = { node -> renameTarget = node },
                         )
                     }
+                }
+
+                val target = renameTarget
+                if (target != null) {
+                    var text by remember(target.id) { mutableStateOf(target.text) }
+                    AlertDialog(
+                        onDismissRequest = { renameTarget = null },
+                        title = { Text("Rename node") },
+                        text = {
+                            OutlinedTextField(value = text, onValueChange = { text = it })
+                        },
+                        confirmButton = {
+                            TextButton(onClick = {
+                                // Real edit path: core.commands.EditTextCommand
+                                // via History (undo-capable), not a raw
+                                // node.text mutation — see android_bridge's
+                                // rename_node(). Re-measure/re-layout after,
+                                // same as after *_structure(): the new text
+                                // likely changed this node's own box size.
+                                val structureJson = bridge.callAttr(
+                                    "rename_node", target.id, text,
+                                ).toString()
+                                root = applyStructureAndLayout(structureJson)
+                                renameTarget = null
+                            }) { Text("Rename") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
+                        },
+                    )
                 }
             }
         }
@@ -230,6 +310,7 @@ private fun MindMapCanvas(
     expanded: Set<String>,
     textMeasurer: androidx.compose.ui.text.TextMeasurer,
     onToggle: (String) -> Unit,
+    onLongPress: (MapNode) -> Unit,
 ) {
     val textStyle = canvasTextStyle
 
@@ -256,19 +337,28 @@ private fun MindMapCanvas(
                 }
             }
             .pointerInput(visible, scale, offset) {
-                detectTapGestures { tapOffset ->
-                    // Invert the same transform drawing applies below
-                    // (translate to center + pan, then scale) to turn a
-                    // screen tap back into a world-space point.
+                // Shared by both gestures: the same screen-to-world inverse
+                // of the transform drawing applies below (translate to
+                // center + pan, then scale), so tap and long-press can
+                // never disagree about which node they landed on.
+                fun hitTest(screenOffset: Offset): VisibleNode? {
                     val centerX = size.width / 2f + offset.x
                     val centerY = size.height / 2f + offset.y
-                    val worldX = (tapOffset.x - centerX) / scale
-                    val worldY = (tapOffset.y - centerY) / scale
-                    val hit = visible.lastOrNull { it.rect.contains(Offset(worldX, worldY)) }
-                    if (hit != null && hit.node.children.isNotEmpty()) {
-                        onToggle(hit.node.id)
-                    }
+                    val worldX = (screenOffset.x - centerX) / scale
+                    val worldY = (screenOffset.y - centerY) / scale
+                    return visible.lastOrNull { it.rect.contains(Offset(worldX, worldY)) }
                 }
+                detectTapGestures(
+                    onTap = { tapOffset ->
+                        val hit = hitTest(tapOffset)
+                        if (hit != null && hit.node.children.isNotEmpty()) {
+                            onToggle(hit.node.id)
+                        }
+                    },
+                    onLongPress = { pressOffset ->
+                        hitTest(pressOffset)?.let { onLongPress(it.node) }
+                    },
+                )
             },
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
