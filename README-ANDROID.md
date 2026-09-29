@@ -9,12 +9,30 @@ A minimal but genuinely working scaffold: Android Studio project, Kotlin +
 Jetpack Compose UI, Chaquopy embedding a full Python 3.12 interpreter,
 `app/src/main/python/synmind/` containing the **exact same** `synmind/core/`
 files copied unmodified from the Windows repo (`untanglemate-windows`).
-`MainActivity` calls into `synmind.core.model` at startup, builds a real
-`MindMap()`, and shows its root node's text on screen — that's the proof
-the whole bridge works, not a placeholder.
 
-`./gradlew :app:assembleDebug` succeeds and produces a real installable
-APK. It has NOT yet been installed/run on a device or emulator.
+`MainActivity` shows a read-only, expandable/collapsible tree of the
+current map (tap a node with children to expand/collapse — UI-only state,
+doesn't touch the model's own `collapsed` field yet). Two ways to get a
+map into it:
+- **"Open .smmap…"** — the real feature. Uses Android's Storage Access
+  Framework (`ActivityResultContracts.OpenDocument`) to pick a file, copies
+  it into the app's cache dir (Chaquopy/`core.document.load()` needs a real
+  filesystem path, not a `content://` URI), then loads it through
+  `synmind.android_bridge.load_map_as_json` — which calls the exact same
+  `core.document.load()` / `core.file_format` Windows uses, Fernet
+  decryption included.
+- **"Load test map"** — debug-only (`BuildConfig.DEBUG`), reads a fixed
+  path from the app's own external files dir. Exists purely so this could
+  be verified end to end via `adb` without scripting the system file
+  picker's UI.
+
+Verified on a real emulator (not just compiled): loaded an actual
+encrypted `.smmap` (root + 2 children + 1 grandchild), title and full tree
+displayed correctly, expand/collapse tested interactively via `adb shell
+input tap`, screenshotted at each step. Confirmed working on both a
+phone-sized (`medium_phone`) and tablet-sized (`medium_tablet`) AVD.
+
+`./gradlew :app:assembleDebug` builds a real installable APK.
 
 ## The core/ subset that's copied in
 
@@ -152,12 +170,47 @@ much faster. `abiFilters` currently builds `arm64-v8a` (real devices) and
 timeout once; if that happens, just rerun, arm64-v8a's already-installed
 packages aren't re-downloaded.
 
+## Gotcha #3: raw `/sdcard/...` paths are NOT readable even by your own app
+
+Scoped storage (Android 10+) blocks direct filesystem access to shared
+storage paths like `/sdcard/Download/whatever` from app code —
+`PermissionError: [Errno 13] Permission denied`, even though `adb push`
+can write there just fine and even for the app that "owns" the intent.
+This bit the debug "Load test map" button specifically. Two ways around
+it, both used here:
+- **Real feature (the "Open .smmap…" button)**: use SAF
+  (`ActivityResultContracts.OpenDocument`), which hands back a
+  `content://` URI with proper access regardless of scoped storage, then
+  copy its bytes into the app's own cache dir before handing a real path
+  to Python.
+- **Debug-only convenience**: `getExternalFilesDir(null)` — the app's own
+  external-storage sandbox, e.g.
+  `/sdcard/Android/data/com.syntheticcodelab.untanglemate/files/` — is
+  readable without any special permission, and `adb push` can write
+  there directly for test fixtures.
+
+## SDK tooling on this machine has moved past `sdkmanager`/`avdmanager`
+
+Both are deprecated; `cmdline-tools/latest/bin/android.exe` (a single new
+binary) replaces them, with real subcommands: `android sdk install
+"system-images;android-37.0;google_apis;x86_64"`,
+`android emulator create medium_phone` / `medium_tablet` (device profiles,
+not raw AVD configs — `--list-profiles` shows what's available),
+`android emulator start <name>` (blocks until fully booted),
+`android emulator stop <name>`. The OLD `sdkmanager.bat` wrapper script
+that ships alongside it silently mis-splits package IDs containing
+semicolons (`system-images;android-37.0;...` → four separate "Package
+not found" errors) — use `android.exe` directly, not the wrapper.
+
 ## Not done yet
 
-- Not installed/run on a real device or emulator (no AVD created yet —
-  `cmdline-tools` isn't installed, so no `avdmanager` on this machine;
-  either install it or create an AVD through Android Studio's own UI).
 - No app icon (manifest has no `android:icon`; builds fine, just shows
   a default).
-- No actual mind-map UI — `MainActivity` only proves the Chaquopy bridge.
-- Nothing committed to git yet as of writing this file.
+- Tree view is read-only — no editing, no writing changes back to the
+  file, no touching the model's real `collapsed` field (expand/collapse
+  in the UI is view-state only).
+- No real mind-map layout/canvas — just an indented list, nothing like
+  the Windows app's actual node graph rendering yet.
+- Not tested against a REAL user map (only the small synthetic
+  root+2-children+1-grandchild fixture) — large maps, aliases, and every
+  other `core/` feature beyond plain parent/child text are unverified.
