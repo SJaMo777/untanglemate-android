@@ -41,6 +41,7 @@ from synmind.core.commands import (
     ReparentNodeCommand,
     SetBorderColorCommand,
     SetFillColorCommand,
+    SetTodoStateCommand,
 )
 from synmind.core.history import History
 from synmind.core.model import MindMap, Node
@@ -68,6 +69,11 @@ def _node_to_dict(node: Node) -> dict:
         # box colors when null rather than guessing a theme color here.
         "fillColor": node.fill_color,
         "borderColor": node.border_color,
+        # Only the two fields a simple due-date list view needs — not
+        # todo_recurrence/todo_priority's full Windows semantics, which
+        # have no Android UI yet.
+        "todoMarked": node.todo_marked,
+        "todoDueAt": node.todo_due_at,
         "children": [_node_to_dict(c) for c in node.children],
     }
 
@@ -238,6 +244,51 @@ def set_border_color(node_id: str, hex_color: str | None) -> str:
         node_id=node_id, old_color=node.border_color, new_color=hex_color))
     _dirty = True
     return _map_to_json(_current)
+
+
+def set_todo(node_id: str, marked: bool, due_at: str | None) -> str:
+    """Marks/unmarks a node as a ToDo with an optional due date, via the
+    real SetTodoStateCommand/History (undo-capable) — same command
+    Windows's own ToDo checkbox and due-date picker go through.
+    due_at: an ISO date string ("YYYY-MM-DD") or null to clear it.
+    todo_recurrence/todo_priority aren't touched — no Android UI for
+    either yet, so they're left exactly as they were."""
+    global _dirty
+    node = _current.find(node_id)
+    if node is None:
+        raise ValueError("No such node: %s" % node_id)
+    _execute(SetTodoStateCommand(
+        node_id=node_id,
+        old_marked=node.todo_marked, old_due_at=node.todo_due_at,
+        new_marked=marked, new_due_at=due_at,
+        old_priority=node.todo_priority, new_priority=node.todo_priority,
+    ))
+    _dirty = True
+    return _map_to_json(_current)
+
+
+def list_todos() -> str:
+    """Every todo_marked node in the current map as {id, text, dueAt},
+    sorted by due date (nodes with no due date last) — a plain due-date
+    list rather than Windows's full month-grid Calendar panel (that
+    panel's review scheduling, recurrence, and Google Calendar sync have
+    no Android equivalent yet), but reading the same real todo_marked/
+    todo_due_at fields."""
+    out: list[dict] = []
+
+    def walk(node: Node) -> None:
+        if node.todo_marked:
+            out.append({
+                "id": node.id,
+                "text": node.text,
+                "dueAt": node.todo_due_at,
+            })
+        for child in node.children:
+            walk(child)
+
+    walk(_current.root)
+    out.sort(key=lambda t: (t["dueAt"] is None, t["dueAt"] or ""))
+    return json.dumps(out)
 
 
 def undo() -> str:

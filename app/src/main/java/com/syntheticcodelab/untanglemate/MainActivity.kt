@@ -82,8 +82,28 @@ data class MapNode(
     val y: Float,
     val fillColor: Color?,
     val borderColor: Color?,
+    // "YYYY-MM-DD" or null — only the two todo_* fields a plain due-date
+    // list needs; todo_priority/todo_recurrence have no Android UI yet.
+    val todoMarked: Boolean,
+    val todoDueAt: String?,
     val children: List<MapNode>,
 )
+
+/** One row of the Calendar dialog's due-date list, parsed from
+ * android_bridge.list_todos(). */
+data class TodoItem(val id: String, val text: String, val dueAt: String?)
+
+private fun parseTodos(json: String): List<TodoItem> {
+    val array = org.json.JSONArray(json)
+    return (0 until array.length()).map { i ->
+        val obj = array.getJSONObject(i)
+        TodoItem(
+            id = obj.getString("id"),
+            text = obj.getString("text"),
+            dueAt = if (obj.isNull("dueAt")) null else obj.getString("dueAt"),
+        )
+    }
+}
 
 private fun parseHexColor(hex: String?): Color? {
     if (hex == null) return null
@@ -106,6 +126,8 @@ private fun parseNode(obj: JSONObject): MapNode {
         y = obj.getDouble("y").toFloat(),
         fillColor = parseHexColor(if (obj.isNull("fillColor")) null else obj.getString("fillColor")),
         borderColor = parseHexColor(if (obj.isNull("borderColor")) null else obj.getString("borderColor")),
+        todoMarked = obj.optBoolean("todoMarked", false),
+        todoDueAt = if (obj.isNull("todoDueAt")) null else obj.getString("todoDueAt"),
         children = children,
     )
 }
@@ -189,6 +211,9 @@ class MainActivity : ComponentActivity() {
             var currentDebugPath by remember { mutableStateOf<String?>(null) }
             var actionTarget by remember { mutableStateOf<MapNode?>(null) }
             var moveTarget by remember { mutableStateOf<MapNode?>(null) }
+            var dueDateTarget by remember { mutableStateOf<MapNode?>(null) }
+            var calendarOpen by remember { mutableStateOf(false) }
+            var todos by remember { mutableStateOf(listOf<TodoItem>()) }
             var canUndo by remember { mutableStateOf(false) }
             var canRedo by remember { mutableStateOf(false) }
             var isDirty by remember { mutableStateOf(false) }
@@ -215,6 +240,17 @@ class MainActivity : ComponentActivity() {
                 title = JSONObject(structureJson).getString("title")
                 root = applyStructureAndLayout(structureJson)
                 expanded.value = setOf(root.id)
+                refreshEditorFlags()
+            }
+
+            fun startNewMap() {
+                val structureJson = bridge.callAttr("new_map_structure").toString()
+                title = JSONObject(structureJson).getString("title")
+                root = applyStructureAndLayout(structureJson)
+                expanded.value = setOf(root.id)
+                currentUri = null
+                currentDebugPath = null
+                selectedNodeId = null
                 refreshEditorFlags()
             }
 
@@ -308,6 +344,13 @@ class MainActivity : ComponentActivity() {
                                         expanded = fileMenuOpen,
                                         onDismissRequest = { fileMenuOpen = false },
                                     ) {
+                                        DropdownMenuItem(
+                                            text = { Text("New Map") },
+                                            onClick = {
+                                                fileMenuOpen = false
+                                                startNewMap()
+                                            },
+                                        )
                                         DropdownMenuItem(
                                             text = { Text("Open .smmap…") },
                                             onClick = {
@@ -427,6 +470,31 @@ class MainActivity : ComponentActivity() {
                                                 }
                                             },
                                         )
+                                        DropdownMenuItem(
+                                            text = { Text("Deselect") },
+                                            enabled = selectedNode != null,
+                                            onClick = {
+                                                editMenuOpen = false
+                                                selectedNodeId = null
+                                            },
+                                        )
+                                        HorizontalDivider()
+                                        DropdownMenuItem(
+                                            text = { Text("Set Due Date…") },
+                                            enabled = selectedNode != null,
+                                            onClick = {
+                                                editMenuOpen = false
+                                                selectedNode?.let { dueDateTarget = it }
+                                            },
+                                        )
+                                    }
+                                }
+                                Box {
+                                    TextButton(onClick = {
+                                        todos = parseTodos(bridge.callAttr("list_todos").toString())
+                                        calendarOpen = true
+                                    }) {
+                                        Text("Calendar")
                                     }
                                 }
                             }
@@ -443,11 +511,18 @@ class MainActivity : ComponentActivity() {
                             // same actions as the File/Edit dropdowns above,
                             // just one tap away instead of two.
                             val selectedNode = selectedNodeId?.let { findMapNode(root, it) }
+                            // Colors pulled straight from the map's own
+                            // palette (root node fill, connector line color)
+                            // rather than a generic dark grey — the same
+                            // idea as menu_bar.py's own comment: "buttons
+                            // are painted like nodes... so the bar reads as
+                            // part of the map rather than a strip of
+                            // unrelated colours."
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(top = 8.dp)
-                                    .background(Color(0xFF2B2B2B), RoundedCornerShape(8.dp))
+                                    .background(Color(0xFF3B2E5A), RoundedCornerShape(8.dp))
                                     .padding(8.dp),
                                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                             ) {
@@ -460,6 +535,7 @@ class MainActivity : ComponentActivity() {
                                     }
                                 }
                                 ToolbarGroup("File") {
+                                    ToolbarIconButton("🆕") { startNewMap() }
                                     ToolbarIconButton("📂") { openDocument.launch(arrayOf("*/*")) }
                                     ToolbarIconButton("💾") { saveCurrentMap() }
                                 }
@@ -500,6 +576,18 @@ class MainActivity : ComponentActivity() {
                                                 expanded.value + node.id
                                             }
                                         }
+                                    }
+                                    ToolbarIconButton("✕", enabled = selectedNode != null) {
+                                        selectedNodeId = null
+                                    }
+                                }
+                                ToolbarGroup("Calendar") {
+                                    ToolbarIconButton("🗓", enabled = selectedNode != null) {
+                                        selectedNode?.let { dueDateTarget = it }
+                                    }
+                                    ToolbarIconButton("📅") {
+                                        todos = parseTodos(bridge.callAttr("list_todos").toString())
+                                        calendarOpen = true
                                     }
                                 }
                             }
@@ -695,6 +783,98 @@ class MainActivity : ComponentActivity() {
                         },
                     )
                 }
+
+                // "Set Due Date…": a plain YYYY-MM-DD text field rather than
+                // a full Material3 DatePicker — this only needs to write a
+                // string android_bridge.set_todo() forwards verbatim to
+                // core.commands.SetTodoStateCommand (which stores it
+                // unparsed until something reads it with
+                // datetime.fromisoformat, same as Windows), so a date
+                // picker widget would add real complexity for a format
+                // check this text field already covers well enough.
+                val dueTarget = dueDateTarget
+                if (dueTarget != null) {
+                    var dateText by remember(dueTarget.id) {
+                        mutableStateOf(dueTarget.todoDueAt ?: "")
+                    }
+                    val dateOk = dateText.isEmpty() ||
+                        Regex("""\d{4}-\d{2}-\d{2}""").matches(dateText)
+                    AlertDialog(
+                        onDismissRequest = { dueDateTarget = null },
+                        title = { Text("Due Date: ${dueTarget.text}") },
+                        text = {
+                            Column {
+                                OutlinedTextField(
+                                    value = dateText,
+                                    onValueChange = { dateText = it },
+                                    label = { Text("YYYY-MM-DD") },
+                                    isError = !dateOk,
+                                    supportingText = {
+                                        if (!dateOk) Text("Use YYYY-MM-DD, or clear the field")
+                                    },
+                                )
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(
+                                enabled = dateOk,
+                                onClick = {
+                                    val due = dateText.ifBlank { null }
+                                    applyMutation(
+                                        bridge.callAttr(
+                                            "set_todo", dueTarget.id, due != null, due,
+                                        ).toString()
+                                    )
+                                    dueDateTarget = null
+                                },
+                            ) { Text(if (dateText.isBlank()) "Clear" else "Save") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { dueDateTarget = null }) { Text("Cancel") }
+                        },
+                    )
+                }
+
+                // Calendar: every todo_marked node with its due date, not
+                // Windows's full month-grid panel (review scheduling,
+                // recurrence, and Google Calendar sync have no Android
+                // equivalent yet) — a plain sorted list is enough to see
+                // what's due and jump to it.
+                if (calendarOpen) {
+                    AlertDialog(
+                        onDismissRequest = { calendarOpen = false },
+                        title = { Text("Calendar") },
+                        text = {
+                            if (todos.isEmpty()) {
+                                Text("No nodes have a due date yet. Select a node, then Edit → Set Due Date…")
+                            } else {
+                                LazyColumn {
+                                    items(todos) { item ->
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .clickable {
+                                                    selectedNodeId = item.id
+                                                    calendarOpen = false
+                                                }
+                                                .padding(vertical = 8.dp),
+                                        ) {
+                                            Text(item.text)
+                                            Text(
+                                                item.dueAt ?: "No due date",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = Color(0xFF673AB7),
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        confirmButton = {
+                            TextButton(onClick = { calendarOpen = false }) { Text("Close") }
+                        },
+                    )
+                }
             }
         }
     }
@@ -712,12 +892,15 @@ private fun ToolbarGroup(
         Text(
             title,
             style = MaterialTheme.typography.labelSmall,
-            color = Color(0xFFAAAAAA),
+            color = Color(0xFFD1C4E9),
         )
         Row(
             modifier = Modifier
                 .padding(top = 2.dp)
-                .background(Color(0xFF3A3A3A), RoundedCornerShape(6.dp))
+                // The map's own root-node purple (see MindMapCanvas's
+                // drawing loop) — the frame reads as one of the map's own
+                // boxes instead of unrelated toolbar chrome.
+                .background(Color(0xFF673AB7), RoundedCornerShape(6.dp))
                 .padding(4.dp),
             horizontalArrangement = Arrangement.spacedBy(2.dp),
             content = content,
@@ -740,7 +923,9 @@ private fun ToolbarIconButton(glyph: String, enabled: Boolean = true, onClick: (
         Text(
             glyph,
             fontSize = 18.sp,
-            color = if (enabled) Color.White else Color(0xFF6E6E6E),
+            // Disabled uses the same purple the canvas draws connector
+            // lines with (see MindMapCanvas), rather than a flat grey.
+            color = if (enabled) Color.White else Color(0xFF9575CD),
         )
     }
 }
