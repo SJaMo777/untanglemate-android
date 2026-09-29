@@ -18,12 +18,14 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.background
@@ -31,14 +33,18 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -67,6 +73,12 @@ import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import org.json.JSONObject
 import java.io.File
+import java.time.Instant
+import java.time.LocalDate
+import java.time.YearMonth
+import java.time.ZoneOffset
+import java.time.format.TextStyle as JavaTextStyle
+import java.util.Locale
 import kotlin.math.roundToInt
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -159,6 +171,7 @@ private val PRESET_COLORS = listOf(
 class MainActivity : ComponentActivity() {
     private lateinit var bridge: PyObject
 
+    @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -814,95 +827,69 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                // "Set Due Date…": a plain YYYY-MM-DD text field rather than
-                // a full Material3 DatePicker — this only needs to write a
-                // string android_bridge.set_todo() forwards verbatim to
-                // core.commands.SetTodoStateCommand (which stores it
-                // unparsed until something reads it with
-                // datetime.fromisoformat, same as Windows), so a date
-                // picker widget would add real complexity for a format
-                // check this text field already covers well enough.
+                // "Set Due Date…": a real Material3 DatePicker. Only the
+                // final "YYYY-MM-DD" string matters to the bridge — it's
+                // forwarded verbatim to core.commands.SetTodoStateCommand,
+                // which stores it unparsed until something reads it with
+                // datetime.fromisoformat, same as Windows — the picker's
+                // own UTC-epoch-millis representation just needs
+                // converting to that string on Save.
                 val dueTarget = dueDateTarget
                 if (dueTarget != null) {
-                    var dateText by remember(dueTarget.id) {
-                        mutableStateOf(dueTarget.todoDueAt ?: "")
+                    val initialMillis = dueTarget.todoDueAt?.let {
+                        runCatching {
+                            LocalDate.parse(it).atStartOfDay(ZoneOffset.UTC).toInstant().toEpochMilli()
+                        }.getOrNull()
                     }
-                    val dateOk = dateText.isEmpty() ||
-                        Regex("""\d{4}-\d{2}-\d{2}""").matches(dateText)
-                    AlertDialog(
+                    val datePickerState = rememberDatePickerState(initialSelectedDateMillis = initialMillis)
+                    DatePickerDialog(
                         onDismissRequest = { dueDateTarget = null },
-                        title = { Text("Due Date: ${dueTarget.text}") },
-                        text = {
-                            Column {
-                                OutlinedTextField(
-                                    value = dateText,
-                                    onValueChange = { dateText = it },
-                                    label = { Text("YYYY-MM-DD") },
-                                    isError = !dateOk,
-                                    supportingText = {
-                                        if (!dateOk) Text("Use YYYY-MM-DD, or clear the field")
-                                    },
-                                )
-                            }
-                        },
                         confirmButton = {
                             TextButton(
-                                enabled = dateOk,
+                                enabled = datePickerState.selectedDateMillis != null,
                                 onClick = {
-                                    val due = dateText.ifBlank { null }
-                                    applyMutation(
-                                        bridge.callAttr(
-                                            "set_todo", dueTarget.id, due != null, due,
-                                        ).toString()
-                                    )
+                                    val millis = datePickerState.selectedDateMillis
+                                    if (millis != null) {
+                                        val due = Instant.ofEpochMilli(millis)
+                                            .atZone(ZoneOffset.UTC).toLocalDate().toString()
+                                        applyMutation(
+                                            bridge.callAttr("set_todo", dueTarget.id, true, due).toString()
+                                        )
+                                    }
                                     dueDateTarget = null
                                 },
-                            ) { Text(if (dateText.isBlank()) "Clear" else "Save") }
+                            ) { Text("Save") }
                         },
                         dismissButton = {
-                            TextButton(onClick = { dueDateTarget = null }) { Text("Cancel") }
-                        },
-                    )
-                }
-
-                // Calendar: every todo_marked node with its due date, not
-                // Windows's full month-grid panel (review scheduling,
-                // recurrence, and Google Calendar sync have no Android
-                // equivalent yet) — a plain sorted list is enough to see
-                // what's due and jump to it.
-                if (calendarOpen) {
-                    AlertDialog(
-                        onDismissRequest = { calendarOpen = false },
-                        title = { Text("Calendar") },
-                        text = {
-                            if (todos.isEmpty()) {
-                                Text("No nodes have a due date yet. Select a node, then Edit → Set Due Date…")
-                            } else {
-                                LazyColumn {
-                                    items(todos) { item ->
-                                        Column(
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .clickable {
-                                                    selectedNodeId = item.id
-                                                    calendarOpen = false
-                                                }
-                                                .padding(vertical = 8.dp),
-                                        ) {
-                                            Text(item.text)
-                                            Text(
-                                                item.dueAt ?: "No due date",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = Color(0xFF673AB7),
-                                            )
-                                        }
-                                    }
+                            Row {
+                                if (dueTarget.todoDueAt != null) {
+                                    TextButton(onClick = {
+                                        applyMutation(
+                                            bridge.callAttr("set_todo", dueTarget.id, false, null).toString()
+                                        )
+                                        dueDateTarget = null
+                                    }) { Text("Clear") }
                                 }
+                                TextButton(onClick = { dueDateTarget = null }) { Text("Cancel") }
                             }
                         },
-                        confirmButton = {
-                            TextButton(onClick = { calendarOpen = false }) { Text("Close") }
-                        },
+                    ) {
+                        DatePicker(state = datePickerState)
+                    }
+                }
+
+                // Calendar: a real month grid, like Windows's CalendarPanel
+                // (calendar_panel.py's _render_month) — weekday header,
+                // days laid out 7-per-row including the leading/trailing
+                // days of adjacent months, a dot on any day with a due
+                // item, tap a day to see what's due and jump to it. Not
+                // ported: week view, review scheduling, recurrence, and
+                // Google Calendar sync — no Android equivalent yet.
+                if (calendarOpen) {
+                    CalendarMonthDialog(
+                        todos = todos,
+                        onSelectNode = { id -> selectedNodeId = id },
+                        onDismiss = { calendarOpen = false },
                     )
                 }
             }
@@ -957,6 +944,148 @@ private fun ToolbarIconButton(glyph: String, enabled: Boolean = true, onClick: (
             // lines with (see MindMapCanvas), rather than a flat grey.
             color = if (enabled) Color.White else Color(0xFF9575CD),
         )
+    }
+}
+
+/** A real month-grid calendar, matching Windows's CalendarPanel
+ * (calendar_panel.py's _render_month): month/year header with prev/next
+ * navigation, a weekday header row, then a 7-column grid of every day in
+ * the month plus the leading/trailing days of the adjacent months so
+ * every week row is full — the same `itermonthdates`-style layout, done
+ * with java.time instead of Python's `calendar` module. */
+@androidx.compose.runtime.Composable
+private fun CalendarMonthDialog(
+    todos: List<TodoItem>,
+    onSelectNode: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var viewMonth by remember { mutableStateOf(YearMonth.now()) }
+    var selectedDay by remember { mutableStateOf<LocalDate?>(LocalDate.now()) }
+
+    val itemsByDate = remember(todos) {
+        todos.mapNotNull { item ->
+            item.dueAt?.let { runCatching { LocalDate.parse(it) }.getOrNull() }?.let { it to item }
+        }.groupBy({ it.first }, { it.second })
+    }
+
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = RoundedCornerShape(16.dp), color = Color(0xFFF3EEFB)) {
+            Column(modifier = Modifier.padding(16.dp).width(340.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = { viewMonth = viewMonth.minusMonths(1) }) { Text("◀") }
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text(
+                            "${viewMonth.month.getDisplayName(JavaTextStyle.FULL, Locale.getDefault())} ${viewMonth.year}",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        TextButton(onClick = {
+                            viewMonth = YearMonth.now()
+                            selectedDay = LocalDate.now()
+                        }) { Text("Today", style = MaterialTheme.typography.labelSmall) }
+                    }
+                    TextButton(onClick = { viewMonth = viewMonth.plusMonths(1) }) { Text("▶") }
+                }
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    for (name in listOf("Mo", "Tu", "We", "Th", "Fr", "Sa", "Su")) {
+                        Text(
+                            name,
+                            modifier = Modifier.weight(1f),
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFF9575CD),
+                        )
+                    }
+                }
+                val firstOfMonth = viewMonth.atDay(1)
+                // DayOfWeek.value is 1=Monday..7=Sunday, matching the Mo-Su
+                // header above — how many cells to back up to reach the
+                // Monday on/before the 1st.
+                val leading = firstOfMonth.dayOfWeek.value - 1
+                val totalDays = leading + viewMonth.lengthOfMonth()
+                val totalCells = ((totalDays + 6) / 7) * 7
+                val gridStart = firstOfMonth.minusDays(leading.toLong())
+                val today = LocalDate.now()
+                for (row in 0 until totalCells / 7) {
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        for (col in 0..6) {
+                            val day = gridStart.plusDays((row * 7 + col).toLong())
+                            val inMonth = day.month == viewMonth.month
+                            val hasItems = itemsByDate.containsKey(day)
+                            val isSelected = day == selectedDay
+                            val isToday = day == today
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .aspectRatio(1f)
+                                    .padding(1.dp)
+                                    .background(
+                                        when {
+                                            isSelected -> Color(0xFF673AB7)
+                                            isToday -> Color(0xFFD1C4E9)
+                                            else -> Color.Transparent
+                                        },
+                                        RoundedCornerShape(6.dp),
+                                    )
+                                    .clickable { selectedDay = day },
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        "${day.dayOfMonth}",
+                                        fontSize = 13.sp,
+                                        color = when {
+                                            isSelected -> Color.White
+                                            !inMonth -> Color(0xFFC5B8E0)
+                                            else -> Color.Black
+                                        },
+                                    )
+                                    if (hasItems) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(5.dp)
+                                                .background(
+                                                    if (isSelected) Color.White else Color(0xFF673AB7),
+                                                    CircleShape,
+                                                ),
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+                val dayItems = selectedDay?.let { itemsByDate[it] } ?: emptyList()
+                Text(
+                    selectedDay?.toString() ?: "",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color(0xFF9575CD),
+                )
+                if (dayItems.isEmpty()) {
+                    Text("Nothing due", modifier = Modifier.padding(top = 4.dp))
+                } else {
+                    Column {
+                        for (item in dayItems) {
+                            Text(
+                                item.text,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { onSelectNode(item.id); onDismiss() }
+                                    .padding(vertical = 6.dp),
+                            )
+                        }
+                    }
+                }
+                TextButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.align(Alignment.End).padding(top = 4.dp),
+                ) { Text("Close") }
+            }
+        }
     }
 }
 
