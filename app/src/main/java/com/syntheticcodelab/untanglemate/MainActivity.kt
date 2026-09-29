@@ -1491,6 +1491,46 @@ private fun MindMapCanvas(
                             ),
                             style = textStyle.copy(color = textColor),
                         )
+                        // Hidden-children count — node_item.py's collapse
+                        // badge (_has_collapse_badge/paint's "if
+                        // self._has_collapse_badge()" block): a small
+                        // circle at the box's right edge with the child
+                        // count, shown only when children exist but aren't
+                        // currently rendered (collapsed here; Windows also
+                        // covers its own depth-cap cases Android doesn't
+                        // have). Uses the same blue as the selection ring
+                        // rather than Windows's theme.selected_fill, since
+                        // this app has no runtime theme system.
+                        if (v.node.children.isNotEmpty() && v.node.id !in expanded) {
+                            val badgeRadius = 11f
+                            val center = Offset(
+                                drawRect.right + badgeRadius + 4f,
+                                drawRect.top + drawRect.height / 2f,
+                            )
+                            drawCircle(color = Color(0xFF1E88E5), radius = badgeRadius, center = center)
+                            drawCircle(
+                                color = Color(0xFF0D47A1),
+                                radius = badgeRadius,
+                                center = center,
+                                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 1.5f),
+                            )
+                            val countLabel = "${v.node.children.size}"
+                            val countStyle = TextStyle(
+                                fontSize = 11.sp,
+                                color = Color.White,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                            )
+                            val countMeasured = textMeasurer.measure(countLabel, countStyle)
+                            drawText(
+                                textMeasurer = textMeasurer,
+                                text = countLabel,
+                                topLeft = Offset(
+                                    center.x - countMeasured.size.width / 2f,
+                                    center.y - countMeasured.size.height / 2f,
+                                ),
+                                style = countStyle,
+                            )
+                        }
                         // Status badges — a row of small circles centered
                         // below the box (Windows's node_item.py has a
                         // "below" badge layout mode alongside its default
