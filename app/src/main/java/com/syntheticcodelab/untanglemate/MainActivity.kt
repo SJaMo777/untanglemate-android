@@ -9,13 +9,21 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
@@ -28,6 +36,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -49,14 +58,26 @@ import java.io.File
 /** One node in the tree, as parsed from android_bridge's JSON. x/y come
  * from the exact same core.layout algorithm Windows uses (see the bridge
  * module's comment): root at (0, 0), branches fanning to both +x and -x,
- * not a top-down tree. */
+ * not a top-down tree. fillColor/borderColor are null when the node uses
+ * the theme default (same meaning as on Windows). */
 data class MapNode(
     val id: String,
     val text: String,
     val x: Float,
     val y: Float,
+    val fillColor: Color?,
+    val borderColor: Color?,
     val children: List<MapNode>,
 )
+
+private fun parseHexColor(hex: String?): Color? {
+    if (hex == null) return null
+    return try {
+        Color(android.graphics.Color.parseColor(hex))
+    } catch (e: IllegalArgumentException) {
+        null
+    }
+}
 
 private fun parseNode(obj: JSONObject): MapNode {
     val childrenArray = obj.getJSONArray("children")
@@ -64,11 +85,28 @@ private fun parseNode(obj: JSONObject): MapNode {
         parseNode(childrenArray.getJSONObject(i))
     }
     return MapNode(
-        obj.getString("id"), obj.getString("text"),
-        obj.getDouble("x").toFloat(), obj.getDouble("y").toFloat(),
-        children,
+        id = obj.getString("id"),
+        text = obj.getString("text"),
+        x = obj.getDouble("x").toFloat(),
+        y = obj.getDouble("y").toFloat(),
+        fillColor = parseHexColor(if (obj.isNull("fillColor")) null else obj.getString("fillColor")),
+        borderColor = parseHexColor(if (obj.isNull("borderColor")) null else obj.getString("borderColor")),
+        children = children,
     )
 }
+
+/** All node ids in this subtree, including the node itself — used to
+ * reject "move a node into its own descendant" in the Move To picker
+ * before ever calling reparent_node (Kotlin already has the full tree,
+ * cheaper to check here than round-trip to ask Python). */
+private fun subtreeIds(node: MapNode, out: MutableSet<String>) {
+    out.add(node.id)
+    node.children.forEach { subtreeIds(it, out) }
+}
+
+private val PRESET_COLORS = listOf(
+    "#EF5350", "#FFA726", "#FFEE58", "#66BB6A", "#42A5F5", "#AB47BC",
+)
 
 class MainActivity : ComponentActivity() {
     private lateinit var bridge: PyObject
@@ -111,8 +149,7 @@ class MainActivity : ComponentActivity() {
                 mutableStateOf(applyStructureAndLayout(bridge.callAttr("new_map_structure").toString()))
             }
             // Expand/collapse is UI-only for now — does not touch the
-            // model's own `collapsed` field (see README-ANDROID.md: not
-            // done yet, no editing, this screen only reads).
+            // model's own `collapsed` field.
             val expanded = remember { mutableStateOf(setOf(root.id)) }
 
             // Where "Save" writes back to. At most one of these is set:
@@ -124,7 +161,17 @@ class MainActivity : ComponentActivity() {
             // fall back to Save As.
             var currentUri by remember { mutableStateOf<Uri?>(null) }
             var currentDebugPath by remember { mutableStateOf<String?>(null) }
-            var renameTarget by remember { mutableStateOf<MapNode?>(null) }
+            var actionTarget by remember { mutableStateOf<MapNode?>(null) }
+            var moveTarget by remember { mutableStateOf<MapNode?>(null) }
+            var canUndo by remember { mutableStateOf(false) }
+            var canRedo by remember { mutableStateOf(false) }
+            var isDirty by remember { mutableStateOf(false) }
+
+            fun refreshEditorFlags() {
+                canUndo = bridge.callAttr("can_undo").toBoolean()
+                canRedo = bridge.callAttr("can_redo").toBoolean()
+                isDirty = bridge.callAttr("is_dirty").toBoolean()
+            }
 
             fun loadFromPath(path: String) {
                 val structureJson = bridge.callAttr("open_map_structure", path).toString()
@@ -134,6 +181,7 @@ class MainActivity : ComponentActivity() {
                 title = JSONObject(structureJson).getString("title")
                 root = applyStructureAndLayout(structureJson)
                 expanded.value = setOf(root.id)
+                refreshEditorFlags()
             }
 
             val openDocument = rememberLauncherForActivityResult(
@@ -167,24 +215,49 @@ class MainActivity : ComponentActivity() {
                 writeSaveTo(uri)
                 currentUri = uri
                 currentDebugPath = null
+                refreshEditorFlags()
             }
 
             fun saveCurrentMap() {
                 val uri = currentUri
                 val debugPath = currentDebugPath
                 when {
-                    uri != null -> writeSaveTo(uri)
-                    debugPath != null -> bridge.callAttr("save_map", debugPath)
+                    uri != null -> {
+                        writeSaveTo(uri)
+                        refreshEditorFlags()
+                    }
+                    debugPath != null -> {
+                        bridge.callAttr("save_map", debugPath)
+                        refreshEditorFlags()
+                    }
                     // Never opened/saved before — nowhere to write to yet.
                     else -> createDocument.launch("Untitled.smmap")
                 }
+            }
+
+            // Every mutating call (rename/add/delete/move/undo/redo) goes
+            // through this: apply the bridge call's own re-layout, then
+            // refresh the undo/redo/dirty flags the same way every time,
+            // so no call site can forget one of the two.
+            fun applyMutation(structureJson: String) {
+                root = applyStructureAndLayout(structureJson)
+                refreshEditorFlags()
             }
 
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     Column(modifier = Modifier.fillMaxSize()) {
                         Column(modifier = Modifier.padding(16.dp)) {
-                            Text(title, style = MaterialTheme.typography.headlineSmall)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(title, style = MaterialTheme.typography.headlineSmall)
+                                if (isDirty) {
+                                    Text(
+                                        "  •  unsaved changes",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = Color(0xFF9C27B0),
+                                    )
+                                }
+                            }
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
                                 horizontalArrangement = Arrangement.spacedBy(12.dp),
@@ -195,6 +268,14 @@ class MainActivity : ComponentActivity() {
                                 Button(onClick = { saveCurrentMap() }) {
                                     Text("Save")
                                 }
+                                Button(
+                                    enabled = canUndo,
+                                    onClick = { applyMutation(bridge.callAttr("undo").toString()) },
+                                ) { Text("Undo") }
+                                Button(
+                                    enabled = canRedo,
+                                    onClick = { applyMutation(bridge.callAttr("redo").toString()) },
+                                ) { Text("Redo") }
                                 if (BuildConfig.DEBUG) {
                                     // Dev-only: sidesteps the system file
                                     // picker's UI for adb-driven testing.
@@ -227,19 +308,88 @@ class MainActivity : ComponentActivity() {
                                     expanded.value + id
                                 }
                             },
-                            onLongPress = { node -> renameTarget = node },
+                            onLongPress = { node -> actionTarget = node },
                         )
                     }
                 }
 
-                val target = renameTarget
+                // Long-press dialog: rename, add child, delete, move,
+                // and a small preset-color styling row. One dialog for
+                // all node actions rather than a separate gesture per
+                // action — AlertDialog only gives two real buttons
+                // (confirm/dismiss), so the extra actions live as their
+                // own row inside `text`.
+                val target = actionTarget
                 if (target != null) {
                     var text by remember(target.id) { mutableStateOf(target.text) }
+                    val isRoot = target.id == root.id
                     AlertDialog(
-                        onDismissRequest = { renameTarget = null },
-                        title = { Text("Rename node") },
+                        onDismissRequest = { actionTarget = null },
+                        title = { Text("Node") },
                         text = {
-                            OutlinedTextField(value = text, onValueChange = { text = it })
+                            Column {
+                                OutlinedTextField(value = text, onValueChange = { text = it })
+                                Row(
+                                    modifier = Modifier.padding(top = 12.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    TextButton(onClick = {
+                                        // Real add path: core.commands.
+                                        // AddNodeCommand via History — see
+                                        // android_bridge.add_child().
+                                        val json = JSONObject(
+                                            bridge.callAttr("add_child", target.id, "New Node").toString()
+                                        )
+                                        applyMutation(json.toString())
+                                        actionTarget = null
+                                    }) { Text("Add Child") }
+                                    if (!isRoot) {
+                                        TextButton(onClick = {
+                                            moveTarget = target
+                                            actionTarget = null
+                                        }) { Text("Move to…") }
+                                    }
+                                    if (!isRoot) {
+                                        TextButton(onClick = {
+                                            // MoveToTrashCommand — undo-capable,
+                                            // see android_bridge.delete_node().
+                                            applyMutation(bridge.callAttr("delete_node", target.id).toString())
+                                            actionTarget = null
+                                        }) { Text("Delete", color = MaterialTheme.colorScheme.error) }
+                                    }
+                                }
+                                Row(
+                                    modifier = Modifier.padding(top = 12.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    for (hex in PRESET_COLORS) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(32.dp)
+                                                .background(parseHexColor(hex) ?: Color.Gray, CircleShape)
+                                                .border(1.dp, Color.Black, CircleShape)
+                                                .clickable {
+                                                    applyMutation(
+                                                        bridge.callAttr("set_fill_color", target.id, hex).toString()
+                                                    )
+                                                    actionTarget = null
+                                                },
+                                        )
+                                    }
+                                    // "Clear" back to the theme default (null).
+                                    Box(
+                                        modifier = Modifier
+                                            .size(32.dp)
+                                            .border(1.dp, Color.Black, CircleShape)
+                                            .clickable {
+                                                applyMutation(
+                                                    bridge.callAttr("set_fill_color", target.id, null).toString()
+                                                )
+                                                actionTarget = null
+                                            },
+                                    ) { Text("×", modifier = Modifier.padding(6.dp)) }
+                                }
+                            }
                         },
                         confirmButton = {
                             TextButton(onClick = {
@@ -249,15 +399,67 @@ class MainActivity : ComponentActivity() {
                                 // rename_node(). Re-measure/re-layout after,
                                 // same as after *_structure(): the new text
                                 // likely changed this node's own box size.
-                                val structureJson = bridge.callAttr(
-                                    "rename_node", target.id, text,
-                                ).toString()
-                                root = applyStructureAndLayout(structureJson)
-                                renameTarget = null
+                                if (text != target.text) {
+                                    applyMutation(bridge.callAttr("rename_node", target.id, text).toString())
+                                }
+                                actionTarget = null
                             }) { Text("Rename") }
                         },
                         dismissButton = {
-                            TextButton(onClick = { renameTarget = null }) { Text("Cancel") }
+                            TextButton(onClick = { actionTarget = null }) { Text("Cancel") }
+                        },
+                    )
+                }
+
+                // "Move to…" picker: a plain list rather than drag-and-drop.
+                // Freeform dragging a node on this canvas would need to
+                // steal single-finger gestures away from pan (which already
+                // owns them via detectTransformGestures) based on whether
+                // the touch started on a node — solvable, but only with
+                // hand-rolled low-level pointer handling that's hard to
+                // verify thoroughly without real multi-touch hardware. A
+                // tap-a-target list is less flashy but uses the exact same
+                // real ReparentNodeCommand and is trivial to get right.
+                val moving = moveTarget
+                if (moving != null) {
+                    val excluded = remember(moving.id) {
+                        mutableSetOf<String>().also { subtreeIds(moving, it) }
+                    }
+                    val candidates = remember(root, moving.id) {
+                        val out = mutableListOf<MapNode>()
+                        fun walk(n: MapNode) {
+                            if (n.id !in excluded) out.add(n)
+                            n.children.forEach { walk(it) }
+                        }
+                        walk(root)
+                        out
+                    }
+                    AlertDialog(
+                        onDismissRequest = { moveTarget = null },
+                        title = { Text("Move \"${moving.text}\" to…") },
+                        text = {
+                            LazyColumn {
+                                items(candidates) { candidate ->
+                                    Text(
+                                        candidate.text,
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                applyMutation(
+                                                    bridge.callAttr(
+                                                        "reparent_node", moving.id, candidate.id,
+                                                    ).toString()
+                                                )
+                                                moveTarget = null
+                                            }
+                                            .padding(vertical = 12.dp),
+                                    )
+                                }
+                            }
+                        },
+                        confirmButton = {},
+                        dismissButton = {
+                            TextButton(onClick = { moveTarget = null }) { Text("Cancel") }
                         },
                     )
                 }
@@ -382,12 +584,30 @@ private fun MindMapCanvas(
                     }
                     for (v in visible) {
                         val isRoot = v.hasParent == null
+                        val fill = v.node.fillColor
+                            ?: (if (isRoot) Color(0xFF673AB7) else Color(0xFFEDE7F6))
                         drawRoundRect(
-                            color = if (isRoot) Color(0xFF673AB7) else Color(0xFFEDE7F6),
+                            color = fill,
                             topLeft = v.rect.topLeft,
                             size = v.rect.size,
                             cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f),
                         )
+                        val border = v.node.borderColor
+                        if (border != null) {
+                            drawRoundRect(
+                                color = border,
+                                topLeft = v.rect.topLeft,
+                                size = v.rect.size,
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f),
+                                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3f / scale),
+                            )
+                        }
+                        // White text reads on both the purple root default
+                        // AND any preset fill color (all mid-to-dark); a
+                        // custom VERY light fill would need dark text
+                        // instead, but none of the presets are light enough
+                        // to need that yet.
+                        val textColor = if (isRoot || v.node.fillColor != null) Color.White else Color.Black
                         drawText(
                             textMeasurer = textMeasurer,
                             text = v.node.text,
@@ -395,9 +615,7 @@ private fun MindMapCanvas(
                                 v.rect.left + NODE_PADDING_H,
                                 v.rect.top + NODE_PADDING_V,
                             ),
-                            style = textStyle.copy(
-                                color = if (isRoot) Color.White else Color.Black,
-                            ),
+                            style = textStyle.copy(color = textColor),
                         )
                     }
                 }

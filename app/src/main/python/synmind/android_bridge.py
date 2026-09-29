@@ -34,12 +34,25 @@ from __future__ import annotations
 import json
 
 from synmind.core import document, layout
-from synmind.core.commands import EditTextCommand
+from synmind.core.commands import (
+    AddNodeCommand,
+    EditTextCommand,
+    MoveToTrashCommand,
+    ReparentNodeCommand,
+    SetBorderColorCommand,
+    SetFillColorCommand,
+)
 from synmind.core.history import History
 from synmind.core.model import MindMap, Node
 
 _current: MindMap | None = None
 _history: History | None = None
+# True once any command has executed since the last new/open/save. Not as
+# precise as comparing undo-stack depth against a saved marker (undoing
+# back to exactly the saved state still reads dirty), but simple, and
+# good enough for a "you have unsaved changes" indicator rather than
+# something correctness-critical.
+_dirty: bool = False
 
 
 def _node_to_dict(node: Node) -> dict:
@@ -49,6 +62,12 @@ def _node_to_dict(node: Node) -> dict:
         "collapsed": node.collapsed,
         "x": node.x,
         "y": node.y,
+        # Hex strings ("#RRGGBB") or null — null means "theme default",
+        # same meaning as on Windows (see model.py's own comment on
+        # fill_color/border_color). Kotlin falls back to its own default
+        # box colors when null rather than guessing a theme color here.
+        "fillColor": node.fill_color,
+        "borderColor": node.border_color,
         "children": [_node_to_dict(c) for c in node.children],
     }
 
@@ -63,9 +82,10 @@ def _map_to_json(mind_map: MindMap) -> str:
 def new_map_structure() -> str:
     """A fresh, empty map — what the app shows before anything is opened.
     Not laid out yet; call apply_measured_layout() next."""
-    global _current, _history
+    global _current, _history, _dirty
     _current = MindMap()
     _history = History(_current)
+    _dirty = False
     return _map_to_json(_current)
 
 
@@ -73,9 +93,10 @@ def open_map_structure(path: str) -> str:
     """Load a real .smmap file (already copied to a local path — Chaquopy/
     core.document need a real filesystem path, not a content:// URI).
     Not laid out yet; call apply_measured_layout() next."""
-    global _current, _history
+    global _current, _history, _dirty
     _current = document.load(path)
     _history = History(_current)
+    _dirty = False
     return _map_to_json(_current)
 
 
@@ -107,6 +128,24 @@ def _require_history() -> History:
     return _history
 
 
+def _execute(command) -> None:
+    """history.execute(), plus a defensive extra invalidate_lookup_cache()
+    afterward. AddNodeCommand.do() (and likely others) calls mind_map.find()
+    on the PARENT before appending the new child — which, since History
+    already invalidated the cache right before do() ran, lazily rebuilds it
+    from the tree as it was A MOMENT before the mutation. Nothing rebuilds
+    it again afterward on this bridge's own account (Windows's canvas
+    masks this by rebuilding its scene, and the cache along with it, after
+    every command) — so a find()/parent_of() call immediately after
+    _history.execute() here would silently miss whatever the command just
+    added. Confirmed by direct repro: reparent_node() on a node added this
+    same call raised "no such node" even though it was plainly present in
+    root.children — traced to exactly this stale cache, not a real
+    "does it exist" problem."""
+    _require_history().execute(command)
+    _current.invalidate_lookup_cache()
+
+
 def rename_node(node_id: str, new_text: str) -> str:
     """Renames through the real EditTextCommand/History (undo-capable,
     updates node.updated_at) rather than mutating node.text directly —
@@ -114,22 +153,106 @@ def rename_node(node_id: str, new_text: str) -> str:
     structure shape again (x/y stale from the old text's size); caller
     must re-measure and call apply_measured_layout, same as after
     *_structure()."""
-    history = _require_history()
+    global _dirty
     node = _current.find(node_id)
     if node is None:
         raise ValueError("No such node: %s" % node_id)
-    history.execute(EditTextCommand(
+    _execute(EditTextCommand(
         node_id=node_id, old_text=node.text, new_text=new_text))
+    _dirty = True
+    return _map_to_json(_current)
+
+
+def add_child(parent_id: str, text: str = "New Node") -> str:
+    """Adds a real child Node via AddNodeCommand/History. Returns
+    {"title", "root", "newNodeId"} — same structure shape as
+    *_structure() plus the new node's id, so the caller can select/
+    open a rename dialog on it immediately without a second round trip
+    to search the tree for "whichever node wasn't there before"."""
+    global _dirty
+    parent = _current.find(parent_id)
+    if parent is None:
+        raise ValueError("No such node: %s" % parent_id)
+    new_node = Node(text=text)
+    _execute(AddNodeCommand(parent_id=parent_id, new_node=new_node))
+    _dirty = True
+    payload = json.loads(_map_to_json(_current))
+    payload["newNodeId"] = new_node.id
+    return json.dumps(payload)
+
+
+def delete_node(node_id: str) -> str:
+    """Moves the node (and its subtree) to mind_map.trash via
+    MoveToTrashCommand — undo-capable, and matches Windows's own default
+    Delete (a permanent DeleteNodeCommand also exists in commands.py but
+    isn't used here — there's no trash-management UI on Android yet to
+    make a permanent-delete option meaningful; undo is the only way back
+    for now, same as it would be without a trash view at all)."""
+    global _dirty
+    if _current.root.id == node_id:
+        raise ValueError("Cannot delete the root node")
+    _execute(MoveToTrashCommand(node_id=node_id))
+    _dirty = True
+    return _map_to_json(_current)
+
+
+def reparent_node(node_id: str, new_parent_id: str) -> str:
+    """Moves a node (and its subtree) to under a different parent via
+    ReparentNodeCommand/History. Caller must already have rejected
+    obviously-invalid targets (new_parent_id == node_id or one of its own
+    descendants) — Kotlin has the full tree client-side and can compute
+    that set more cheaply than round-tripping to ask Python first."""
+    global _dirty
+    old_parent = _current.parent_of(node_id)
+    if old_parent is None:
+        raise ValueError("No such node, or it has no parent: %s" % node_id)
+    if _current.find(new_parent_id) is None:
+        raise ValueError("No such parent: %s" % new_parent_id)
+    old_index = _current.index_of_child(old_parent.id, node_id)
+    _execute(ReparentNodeCommand(
+        node_id=node_id, old_parent_id=old_parent.id, old_index=old_index,
+        new_parent_id=new_parent_id))
+    _dirty = True
+    return _map_to_json(_current)
+
+
+def set_fill_color(node_id: str, hex_color: str | None) -> str:
+    """hex_color: "#RRGGBB" or null to clear back to the theme default."""
+    global _dirty
+    node = _current.find(node_id)
+    if node is None:
+        raise ValueError("No such node: %s" % node_id)
+    _execute(SetFillColorCommand(
+        node_id=node_id, old_color=node.fill_color, new_color=hex_color))
+    _dirty = True
+    return _map_to_json(_current)
+
+
+def set_border_color(node_id: str, hex_color: str | None) -> str:
+    """hex_color: "#RRGGBB" or null to clear back to the theme default."""
+    global _dirty
+    node = _current.find(node_id)
+    if node is None:
+        raise ValueError("No such node: %s" % node_id)
+    _execute(SetBorderColorCommand(
+        node_id=node_id, old_color=node.border_color, new_color=hex_color))
+    _dirty = True
     return _map_to_json(_current)
 
 
 def undo() -> str:
+    global _dirty
     _require_history().undo()
+    _current.invalidate_lookup_cache()
+    _dirty = True
     return _map_to_json(_current)
 
 
 def redo() -> str:
+    global _dirty
     _require_history().redo()
+    _current.invalidate_lookup_cache()
+    _dirty = True
     return _map_to_json(_current)
 
 
@@ -141,12 +264,17 @@ def can_redo() -> bool:
     return _require_history().can_redo()
 
 
+def is_dirty() -> bool:
+    return _dirty
+
+
 def save_map(path: str) -> None:
     """Writes the current map to a real filesystem path in the same
     Fernet-encrypted format Windows reads/writes (core.file_format,
     unmodified). Caller is responsible for getting those bytes to their
     real destination — a content:// URI (SAF) can't be written directly
     from core.document.save(), which does its own Path(path).write_bytes()."""
+    global _dirty
     if _current is None:
         raise RuntimeError("save_map called before a map was loaded/created")
     # write_history=False: the node-history sidecar Windows writes
@@ -155,3 +283,4 @@ def save_map(path: str) -> None:
     # sidecar file next to it), so skip generating one rather than
     # leave an orphaned file behind in the app's cache dir.
     document.save(_current, path, write_history=False)
+    _dirty = False

@@ -15,14 +15,61 @@ boxes positioned by the exact same `core.layout.apply_layout()` Windows
 uses (root at `(0,0)`, branches fanning to both `+x`/`-x` for the default
 "tidy_branched" style, not a top-down tree), connector lines between
 parent and child, pan (drag), pinch-zoom (wired up, not yet interactively
-verified — see below), tap-to-expand/collapse a node with children
-(UI-only state — doesn't touch the model's own `collapsed` field), and
-now real editing: **long-press a node → rename it**. This goes through
-`core.commands.EditTextCommand` via `core.history.History` (kept as
-module state in `android_bridge._history`) — a real, undo-capable edit
-exactly like Windows's own rename, not a raw `node.text = ...`
-mutation — then re-measures/re-lays-out the same way as a fresh load,
-since the new text likely changed that node's own box size.
+verified — see below), and tap-to-expand/collapse a node with children
+(UI-only state — doesn't touch the model's own `collapsed` field).
+
+**Long-press a node** opens a "Node" dialog with everything editing
+needs, all through real `core.commands.*` objects via `core.history.
+History` (module state in `android_bridge._history`) — undo-capable,
+exactly like Windows's own edits, never a raw `node.text = ...`-style
+mutation:
+- **Rename** (`EditTextCommand`) — the text field's current value, Rename
+  to confirm.
+- **Add Child** (`AddNodeCommand`) — appends "New Node" and re-lays-out
+  immediately.
+- **Delete** (`MoveToTrashCommand`, hidden for root) — moves the subtree
+  to `mind_map.trash`. A permanent `DeleteNodeCommand` also exists in
+  commands.py but isn't used here: undo is the only way back since there's
+  no trash-management UI on Android yet, same as it would be without a
+  trash view at all.
+- **Move to…** (`ReparentNodeCommand`, hidden for root) — opens a second
+  dialog: a plain tappable list of every OTHER node (self and its own
+  descendants excluded client-side before ever calling Python). This is
+  deliberately NOT drag-and-drop: a free-drag gesture on this canvas would
+  need to steal single-finger touches away from pan (which already owns
+  them) based on where the touch started, solvable only with hand-rolled
+  low-level pointer handling that's hard to verify without real multi-
+  touch hardware. A tap-a-target list gets the exact same real command
+  with far less risk of a subtly-wrong gesture.
+- **Preset color swatches** (`SetFillColorCommand`) plus a "×" to clear
+  back to the theme default (`null`) — real node styling, not just a
+  Kotlin-side highlight.
+
+Every one of these (plus Undo/Redo, now buttons in the header, enabled/
+disabled via `can_undo()`/`can_redo()`) re-measures and re-lays-out the
+same way as a fresh load, since any of them can change a node's own box
+size or the tree shape. A **"• unsaved changes"** indicator next to the
+title tracks `android_bridge.is_dirty()` — a simple "any command ran
+since the last new/open/save" flag, not the more precise "does the
+current state actually differ from what's on disk" (undoing back to
+exactly the saved state still reads dirty) — good enough for a hint, not
+correctness-critical.
+
+**Real bug found and fixed while building this**: `AddNodeCommand.do()`
+calls `mind_map.find(parent_id)` — which lazily rebuilds the O(1) lookup
+cache — BEFORE appending the new child, then nothing invalidates that
+cache again afterward on this bridge's own account. The very next
+`find()`/`parent_of()` call (e.g. `reparent_node()` on a node just added
+in the same session) would silently miss it, even though it was plainly
+present in `root.children`. Windows's own canvas masks this by rebuilding
+its scene (and the cache with it) after every command; this bridge has no
+such step, so it bites immediately. Fixed defensively on the Android side
+only (`android_bridge._execute()` calls `invalidate_lookup_cache()` right
+after `history.execute()`) rather than touching the shared `commands.py`
+— confirmed via a standalone repro on plain Windows Python that this is a
+real latent ordering issue in `AddNodeCommand.do()` itself, not anything
+Chaquopy/Android-specific, so it's worth someone eventually fixing at the
+source, but this bridge doesn't need to wait for that.
 
 **Save** writes through `core.document.save()` (the same Fernet-encrypted
 format, `write_history=False` since there's nowhere for Windows's
@@ -256,24 +303,28 @@ not found" errors) — use `android.exe` directly, not the wrapper.
 
 - No app icon (manifest has no `android:icon`; builds fine, just shows
   a default).
-- Only renaming is implemented — no add/delete/move/reparent a node yet,
-  and expand/collapse is still UI-only (doesn't touch the model's real
-  `collapsed` field). No undo/redo UI either, though `android_bridge`
-  already exposes `undo()`/`redo()`/`can_undo()`/`can_redo()` — wiring
-  buttons up is the next small step, not a new design.
-- Save has no dirty-tracking or "unsaved changes" indicator — it always
-  writes, and there's no warning before navigating away from an edited,
-  unsaved map.
+- Expand/collapse is still UI-only (doesn't touch the model's real
+  `collapsed` field).
+- Move is a tap-a-target picker, not drag-and-drop — see the "Move to…"
+  paragraph above for why that was a deliberate scope decision, not a
+  missing feature.
+- Node styling covers fill color only (6 presets + clear) — no border
+  color UI (the bridge's `set_border_color()` exists and works, just
+  nothing in Kotlin calls it yet), no images, no badges. Every custom
+  fill color also forces white text — fine for the current presets
+  (all mid-to-dark) but would misread on a very light custom color if
+  one were ever added.
+- No warning before navigating away from (or overwriting via "Load test
+  map"/"Open") an edited, unsaved map — `isDirty` is only ever shown as
+  the header hint, never gates anything.
+- Not tested against a REAL user map (only synthetic fixtures, largest
+  27 nodes) — large maps, aliases, and every other `core/` feature beyond
+  plain parent/child text + fill color are unverified. Untested at scale:
+  `computeVisible` walks and re-measures the ENTIRE expanded subtree on
+  every recomposition with no memoization beyond the `remember(root,
+  expanded)` key — fine for dozens of nodes, likely needs work before
+  trying a map with hundreds.
 - Pinch-zoom is wired up in code (`detectTransformGestures` updates
   `scale`) but NOT verified interactively — `adb shell input` doesn't
   have a simple multi-touch pinch primitive, only pan (drag) was
   actually tested this round.
-- No node styling (fill/border colors, images, badges) — every box is
-  the same two colors regardless of what the map actually stores.
-- Not tested against a REAL user map (only the small synthetic
-  root+2-children+1-grandchild fixture) — large maps, aliases, and every
-  other `core/` feature beyond plain parent/child text are unverified.
-  Untested at scale: `computeVisible` walks and re-measures the ENTIRE
-  expanded subtree on every recomposition with no memoization beyond the
-  `remember(root, expanded)` key — fine for a handful of nodes, likely
-  needs work before trying a map with hundreds.
