@@ -205,9 +205,17 @@ private fun computeVisible(
     val textSize = measure(node.text)
     val w = textSize.width + NODE_PADDING_H * 2
     val h = textSize.height + NODE_PADDING_V * 2
+    // node.x/node.y are the node's TOP-LEFT corner, not its center — see
+    // core.layout._layout_h_children's own docstring ("anchor.x/anchor.y
+    // are the anchor node's TOP-LEFT"). Treating them as a center here
+    // was a real bug: it silently shifted every box by half its own
+    // size, which still LOOKED like a plausible fan-out tree but
+    // produced wrong spacing (a visible root/child overlap on a wider
+    // map) that briefly looked like a layout.py bug until the
+    // convention mismatch was traced back to this line.
     val rect = Rect(
-        left = node.x - w / 2, top = node.y - h / 2,
-        right = node.x + w / 2, bottom = node.y + h / 2,
+        left = node.x, top = node.y,
+        right = node.x + w, bottom = node.y + h,
     )
     out.add(VisibleNode(node, parent, rect))
     if (node.children.isEmpty() || node.id !in expanded) return
@@ -267,10 +275,14 @@ private fun MindMapCanvas(
             translate(left = size.width / 2f + offset.x, top = size.height / 2f + offset.y) {
                 scale(scale, pivot = Offset.Zero) {
                     // Connectors first so node boxes paint over the ends.
+                    // Centers come from each node's own computed rect
+                    // (id-keyed lookup), not raw node.x/y — those are
+                    // top-left corners, not centers (see computeVisible).
+                    val rectById = visible.associate { it.node.id to it.rect }
                     for (v in visible) {
                         val parent = v.hasParent ?: continue
-                        val parentCenter = Offset(parent.x, parent.y)
-                        val childCenter = Offset(v.node.x, v.node.y)
+                        val parentCenter = rectById.getValue(parent.id).center
+                        val childCenter = v.rect.center
                         drawLine(
                             color = Color(0xFF9575CD),
                             start = parentCenter,

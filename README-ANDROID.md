@@ -46,13 +46,19 @@ real map — the estimate runs low for ordinary Latin text by design (see
   be verified end to end via `adb` without scripting the system file
   picker's UI.
 
-**Known issue, tracked separately, NOT fixed here**: even with real
-measured sizes fed in correctly, `layout.py` can still place an immediate
-child of the root close enough to overlap the root's own box — confirmed
-reproducible on plain Windows Python, not Android-specific, so it's a
-real gap in the shared algorithm's root-adjacent spacing, not something
-to patch around in this app. See the todo tagged `core-logic`/`layout`.
-Deeper levels (grandchildren etc.) spaced correctly in the same test.
+**Correction to an earlier version of this note**: an apparent root/child
+overlap here was first (wrongly) diagnosed as a `layout.py` bug and even
+filed as a `core-logic` todo — retracted once traced properly. The real
+cause: `node.x`/`node.y` are each node's TOP-LEFT corner (per
+`_layout_h_children`'s own docstring — `root.x = 0` means the root's box
+spans `[0, width]`, not `[-width/2, +width/2]`), and `computeVisible` in
+`MainActivity.kt` was drawing every box as if `x, y` were its CENTER.
+That silently shifted every box by half its own size — close enough to
+still look like a plausible fan-out tree, which is how it got as far as
+being misattributed to the shared layout algorithm instead. Fixed by
+computing each rect as `[x, x+w] x [y, y+h]` and deriving connector-line
+endpoints from each node's own rect center (an id-keyed lookup) instead
+of treating raw `x, y` as a center. `layout.py` itself needed no changes.
 
 Verified on a real emulator (not just compiled): loaded an actual
 encrypted `.smmap` (root + 2 children + 1 grandchild), title and full tree
