@@ -717,6 +717,33 @@ class MainActivity : ComponentActivity() {
                                             },
                                     ) { Text("×", modifier = Modifier.padding(6.dp)) }
                                 }
+                                // Same actions as the hold-down/right-click
+                                // context menu's ToDo items, but reachable
+                                // through only plain taps (this dialog also
+                                // opens via triple-tap or the toolbar/Edit
+                                // menu) — no press-and-hold timing involved,
+                                // for anyone whose hold-down gesture isn't
+                                // registering reliably (e.g. a mouse on the
+                                // emulator rather than a real touchscreen).
+                                Row(
+                                    modifier = Modifier.padding(top = 12.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    TextButton(onClick = {
+                                        applyMutation(
+                                            bridge.callAttr(
+                                                "set_todo", target.id, !target.todoMarked, target.todoDueAt,
+                                            ).toString()
+                                        )
+                                        actionTarget = null
+                                    }) {
+                                        Text(if (target.todoMarked) "Unmark as ToDo" else "Mark as ToDo")
+                                    }
+                                    TextButton(onClick = {
+                                        dueDateTarget = target
+                                        actionTarget = null
+                                    }) { Text("Set Due Date…") }
+                                }
                             }
                         },
                         confirmButton = {
