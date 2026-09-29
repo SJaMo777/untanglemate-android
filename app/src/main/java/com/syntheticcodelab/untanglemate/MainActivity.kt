@@ -31,6 +31,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -107,6 +108,17 @@ private fun parseNode(obj: JSONObject): MapNode {
     )
 }
 
+/** Looks up a node by id from the root — used by the header's Edit menu,
+ * which only carries the selected id (not the MapNode itself, so it stays
+ * correct across recompositions after an edit changes the tree). */
+private fun findMapNode(node: MapNode, id: String): MapNode? {
+    if (node.id == id) return node
+    for (child in node.children) {
+        findMapNode(child, id)?.let { return it }
+    }
+    return null
+}
+
 /** All node ids in this subtree, including the node itself — used to
  * reject "move a node into its own descendant" in the Move To picker
  * before ever calling reparent_node (Kotlin already has the full tree,
@@ -178,7 +190,14 @@ class MainActivity : ComponentActivity() {
             var canUndo by remember { mutableStateOf(false) }
             var canRedo by remember { mutableStateOf(false) }
             var isDirty by remember { mutableStateOf(false) }
-            var menuExpanded by remember { mutableStateOf(false) }
+            var fileMenuOpen by remember { mutableStateOf(false) }
+            var editMenuOpen by remember { mutableStateOf(false) }
+            // Hoisted up from the canvas (rather than living as the
+            // canvas's own local state) so the Edit menu — which lives in
+            // this header, not inside MindMapCanvas — can act on whichever
+            // node a tap last selected, the same way Windows's Edit menu
+            // acts on canvas.selected_node.
+            var selectedNodeId by remember { mutableStateOf<String?>(null) }
 
             fun refreshEditorFlags() {
                 canUndo = bridge.callAttr("can_undo").toBoolean()
@@ -271,45 +290,33 @@ class MainActivity : ComponentActivity() {
                                     )
                                 }
                             }
+                            // A real top menu bar, like Windows's File/Edit —
+                            // Edit acts on whichever node is currently
+                            // selected (selectedNodeId), the same way
+                            // Windows's Edit menu acts on canvas.selected_node.
                             Row(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
-                                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Button(
-                                    enabled = canUndo,
-                                    onClick = { applyMutation(bridge.callAttr("undo").toString()) },
-                                ) { Text("Undo") }
-                                Button(
-                                    enabled = canRedo,
-                                    onClick = { applyMutation(bridge.callAttr("redo").toString()) },
-                                ) { Text("Redo") }
-                                // Everything less frequent than undo/redo
-                                // lives behind one overflow menu instead of
-                                // its own top-level button — the button row
-                                // was already at four items with only Open/
-                                // Save/debug-load, and every new action
-                                // (border color, export, etc.) would have
-                                // meant yet another button squeezed in.
                                 Box {
-                                    TextButton(onClick = { menuExpanded = true }) {
-                                        Text("⋮ More")
+                                    TextButton(onClick = { fileMenuOpen = true }) {
+                                        Text("File")
                                     }
                                     DropdownMenu(
-                                        expanded = menuExpanded,
-                                        onDismissRequest = { menuExpanded = false },
+                                        expanded = fileMenuOpen,
+                                        onDismissRequest = { fileMenuOpen = false },
                                     ) {
                                         DropdownMenuItem(
                                             text = { Text("Open .smmap…") },
                                             onClick = {
-                                                menuExpanded = false
+                                                fileMenuOpen = false
                                                 openDocument.launch(arrayOf("*/*"))
                                             },
                                         )
                                         DropdownMenuItem(
                                             text = { Text("Save") },
                                             onClick = {
-                                                menuExpanded = false
+                                                fileMenuOpen = false
                                                 saveCurrentMap()
                                             },
                                         )
@@ -329,7 +336,7 @@ class MainActivity : ComponentActivity() {
                                             DropdownMenuItem(
                                                 text = { Text("Load test map") },
                                                 onClick = {
-                                                    menuExpanded = false
+                                                    fileMenuOpen = false
                                                     val f = File(getExternalFilesDir(null), "test.smmap")
                                                     loadFromPath(f.absolutePath)
                                                     currentDebugPath = f.absolutePath
@@ -337,6 +344,87 @@ class MainActivity : ComponentActivity() {
                                                 },
                                             )
                                         }
+                                    }
+                                }
+                                Box {
+                                    TextButton(onClick = { editMenuOpen = true }) {
+                                        Text("Edit")
+                                    }
+                                    val selectedNode = selectedNodeId?.let { findMapNode(root, it) }
+                                    DropdownMenu(
+                                        expanded = editMenuOpen,
+                                        onDismissRequest = { editMenuOpen = false },
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("Undo") },
+                                            enabled = canUndo,
+                                            onClick = {
+                                                editMenuOpen = false
+                                                applyMutation(bridge.callAttr("undo").toString())
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Redo") },
+                                            enabled = canRedo,
+                                            onClick = {
+                                                editMenuOpen = false
+                                                applyMutation(bridge.callAttr("redo").toString())
+                                            },
+                                        )
+                                        HorizontalDivider()
+                                        DropdownMenuItem(
+                                            text = { Text("Add Child") },
+                                            onClick = {
+                                                editMenuOpen = false
+                                                val targetId = selectedNodeId ?: root.id
+                                                val json = JSONObject(
+                                                    bridge.callAttr("add_child", targetId, "New Node").toString()
+                                                )
+                                                applyMutation(json.toString())
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Edit Text / Style…") },
+                                            enabled = selectedNode != null,
+                                            onClick = {
+                                                editMenuOpen = false
+                                                selectedNode?.let { actionTarget = it }
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Move to…") },
+                                            enabled = selectedNode != null && selectedNode.id != root.id,
+                                            onClick = {
+                                                editMenuOpen = false
+                                                selectedNode?.let { moveTarget = it }
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                                            enabled = selectedNode != null && selectedNode.id != root.id,
+                                            onClick = {
+                                                editMenuOpen = false
+                                                selectedNode?.let {
+                                                    applyMutation(bridge.callAttr("delete_node", it.id).toString())
+                                                    selectedNodeId = null
+                                                }
+                                            },
+                                        )
+                                        HorizontalDivider()
+                                        DropdownMenuItem(
+                                            text = { Text("Toggle Collapse") },
+                                            enabled = selectedNode != null && selectedNode.children.isNotEmpty(),
+                                            onClick = {
+                                                editMenuOpen = false
+                                                selectedNode?.let { node ->
+                                                    expanded.value = if (node.id in expanded.value) {
+                                                        expanded.value - node.id
+                                                    } else {
+                                                        expanded.value + node.id
+                                                    }
+                                                }
+                                            },
+                                        )
                                     }
                                 }
                             }
@@ -352,19 +440,16 @@ class MainActivity : ComponentActivity() {
                                     expanded.value + id
                                 }
                             },
-                            // Was long-press — freed up for the new
-                            // press-and-drag-to-move gesture below.
                             onOpenActions = { node -> actionTarget = node },
                             onReparent = { nodeId, newParentId ->
                                 applyMutation(
                                     bridge.callAttr("reparent_node", nodeId, newParentId).toString()
                                 )
                             },
-                            // Right-click (mouse secondary button) context
-                            // menu — quick versions of the same actions the
-                            // full "Node" dialog offers, for anyone with a
-                            // mouse/trackpad attached (Chromebook, DeX, a
-                            // tablet with a mouse) rather than only touch.
+                            // Right-click (mouse secondary button) or tap-
+                            // then-hold (touch) context menu — quick versions
+                            // of the same actions the full "Node" dialog
+                            // offers.
                             onQuickAddChild = { node ->
                                 val json = JSONObject(
                                     bridge.callAttr("add_child", node.id, "New Node").toString()
@@ -373,8 +458,14 @@ class MainActivity : ComponentActivity() {
                             },
                             onQuickDelete = { node ->
                                 applyMutation(bridge.callAttr("delete_node", node.id).toString())
+                                if (selectedNodeId == node.id) selectedNodeId = null
                             },
                             onMoveRequest = { node -> moveTarget = node },
+                            // Hoisted so the header's Edit menu (outside the
+                            // canvas) can see and act on the same selection
+                            // a tap sets.
+                            selectedNodeId = selectedNodeId,
+                            onSelect = { id -> selectedNodeId = id },
                         )
                     }
                 }
@@ -587,6 +678,8 @@ private fun MindMapCanvas(
     onQuickAddChild: (MapNode) -> Unit,
     onQuickDelete: (MapNode) -> Unit,
     onMoveRequest: (MapNode) -> Unit,
+    selectedNodeId: String?,
+    onSelect: (String?) -> Unit,
 ) {
     val textStyle = canvasTextStyle
 
@@ -607,11 +700,6 @@ private fun MindMapCanvas(
     var contextMenuOpen by remember { mutableStateOf(false) }
     var contextMenuNode by remember { mutableStateOf<MapNode?>(null) }
     var contextMenuScreenPos by remember { mutableStateOf(Offset.Zero) }
-
-    // Selection is pure display state — a single tap just marks a node as
-    // selected (a highlight ring); it doesn't touch the model at all, so
-    // it lives here rather than round-tripping through the bridge.
-    var selectedNodeId by remember { mutableStateOf<String?>(null) }
 
     val visible = remember(root, expanded) {
         val out = mutableListOf<VisibleNode>()
@@ -778,7 +866,7 @@ private fun MindMapCanvas(
                             }
                             if (nextDown == null || tapCount >= 3) {
                                 when (tapCount) {
-                                    1 -> selectedNodeId = hitNode?.id
+                                    1 -> onSelect(hitNode?.id)
                                     2 -> hitNode?.let {
                                         if (it.children.isNotEmpty()) onToggle(it.id)
                                     }
