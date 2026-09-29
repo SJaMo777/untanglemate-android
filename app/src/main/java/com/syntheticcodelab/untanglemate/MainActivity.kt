@@ -27,6 +27,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -167,6 +169,7 @@ class MainActivity : ComponentActivity() {
             var canUndo by remember { mutableStateOf(false) }
             var canRedo by remember { mutableStateOf(false) }
             var isDirty by remember { mutableStateOf(false) }
+            var menuExpanded by remember { mutableStateOf(false) }
 
             fun refreshEditorFlags() {
                 canUndo = bridge.callAttr("can_undo").toBoolean()
@@ -262,13 +265,8 @@ class MainActivity : ComponentActivity() {
                             Row(
                                 modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
                                 horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                verticalAlignment = Alignment.CenterVertically,
                             ) {
-                                Button(onClick = { openDocument.launch(arrayOf("*/*")) }) {
-                                    Text("Open .smmap…")
-                                }
-                                Button(onClick = { saveCurrentMap() }) {
-                                    Text("Save")
-                                }
                                 Button(
                                     enabled = canUndo,
                                     onClick = { applyMutation(bridge.callAttr("undo").toString()) },
@@ -277,23 +275,59 @@ class MainActivity : ComponentActivity() {
                                     enabled = canRedo,
                                     onClick = { applyMutation(bridge.callAttr("redo").toString()) },
                                 ) { Text("Redo") }
-                                if (BuildConfig.DEBUG) {
-                                    // Dev-only: sidesteps the system file
-                                    // picker's UI for adb-driven testing.
-                                    // Never shown in a release build. Uses
-                                    // the app's own external files dir, not
-                                    // /sdcard/Download directly — scoped
-                                    // storage blocks raw path access there
-                                    // even for the app's own reads/writes,
-                                    // which is exactly why the real Open
-                                    // button above goes through SAF instead.
-                                    Button(onClick = {
-                                        val f = File(getExternalFilesDir(null), "test.smmap")
-                                        loadFromPath(f.absolutePath)
-                                        currentDebugPath = f.absolutePath
-                                        currentUri = null
-                                    }) {
-                                        Text("Load test map")
+                                // Everything less frequent than undo/redo
+                                // lives behind one overflow menu instead of
+                                // its own top-level button — the button row
+                                // was already at four items with only Open/
+                                // Save/debug-load, and every new action
+                                // (border color, export, etc.) would have
+                                // meant yet another button squeezed in.
+                                Box {
+                                    TextButton(onClick = { menuExpanded = true }) {
+                                        Text("⋮ More")
+                                    }
+                                    DropdownMenu(
+                                        expanded = menuExpanded,
+                                        onDismissRequest = { menuExpanded = false },
+                                    ) {
+                                        DropdownMenuItem(
+                                            text = { Text("Open .smmap…") },
+                                            onClick = {
+                                                menuExpanded = false
+                                                openDocument.launch(arrayOf("*/*"))
+                                            },
+                                        )
+                                        DropdownMenuItem(
+                                            text = { Text("Save") },
+                                            onClick = {
+                                                menuExpanded = false
+                                                saveCurrentMap()
+                                            },
+                                        )
+                                        if (BuildConfig.DEBUG) {
+                                            // Dev-only: sidesteps the system
+                                            // file picker's UI for adb-driven
+                                            // testing. Never shown in a
+                                            // release build. Uses the app's
+                                            // own external files dir, not
+                                            // /sdcard/Download directly —
+                                            // scoped storage blocks raw path
+                                            // access there even for the
+                                            // app's own reads/writes, which
+                                            // is exactly why the real Open
+                                            // action above goes through SAF
+                                            // instead.
+                                            DropdownMenuItem(
+                                                text = { Text("Load test map") },
+                                                onClick = {
+                                                    menuExpanded = false
+                                                    val f = File(getExternalFilesDir(null), "test.smmap")
+                                                    loadFromPath(f.absolutePath)
+                                                    currentDebugPath = f.absolutePath
+                                                    currentUri = null
+                                                },
+                                            )
+                                        }
                                     }
                                 }
                             }
