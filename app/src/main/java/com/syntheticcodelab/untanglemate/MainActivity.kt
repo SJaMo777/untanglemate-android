@@ -7,6 +7,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.lazy.LazyColumn
@@ -308,7 +309,14 @@ class MainActivity : ComponentActivity() {
                                     expanded.value + id
                                 }
                             },
-                            onLongPress = { node -> actionTarget = node },
+                            // Was long-press — freed up for the new
+                            // press-and-drag-to-move gesture below.
+                            onOpenActions = { node -> actionTarget = node },
+                            onReparent = { nodeId, newParentId ->
+                                applyMutation(
+                                    bridge.callAttr("reparent_node", nodeId, newParentId).toString()
+                                )
+                            },
                         )
                     }
                 }
@@ -512,12 +520,25 @@ private fun MindMapCanvas(
     expanded: Set<String>,
     textMeasurer: androidx.compose.ui.text.TextMeasurer,
     onToggle: (String) -> Unit,
-    onLongPress: (MapNode) -> Unit,
+    // Was long-press — moved to double-tap to free long-press up for
+    // press-and-drag-to-move below (detectDragGesturesAfterLongPress
+    // and "open the node dialog on long-press" both want the same
+    // gesture start, so one of them had to move).
+    onOpenActions: (MapNode) -> Unit,
+    onReparent: (nodeId: String, newParentId: String) -> Unit,
 ) {
     val textStyle = canvasTextStyle
 
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
+
+    // Drag-to-move state. dragScreenDelta accumulates raw pointer motion
+    // (screen pixels); converted to world units (÷ scale) only where it's
+    // actually used, since world-space distances scale with zoom but raw
+    // finger motion doesn't.
+    var draggingNodeId by remember { mutableStateOf<String?>(null) }
+    var dragScreenDelta by remember { mutableStateOf(Offset.Zero) }
+    var dropTargetId by remember { mutableStateOf<String?>(null) }
 
     val visible = remember(root, expanded) {
         val out = mutableListOf<VisibleNode>()
@@ -529,26 +550,36 @@ private fun MindMapCanvas(
         out
     }
 
+    fun worldPoint(screenOffset: Offset, canvasSize: androidx.compose.ui.unit.IntSize): Offset {
+        val centerX = canvasSize.width / 2f + offset.x
+        val centerY = canvasSize.height / 2f + offset.y
+        return Offset((screenOffset.x - centerX) / scale, (screenOffset.y - centerY) / scale)
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
             .pointerInput(Unit) {
                 detectTransformGestures { _, pan, zoom, _ ->
-                    scale = (scale * zoom).coerceIn(0.2f, 4f)
-                    offset += pan
+                    // Only pans/zooms empty space — a touch that starts on
+                    // a node is claimed by the drag-to-move detector below
+                    // instead (see its own onDragStart). Compose still
+                    // routes the initial down here too, so without this
+                    // guard a node-drag would ALSO pan the canvas under it.
+                    if (draggingNodeId == null) {
+                        scale = (scale * zoom).coerceIn(0.2f, 4f)
+                        offset += pan
+                    }
                 }
             }
             .pointerInput(visible, scale, offset) {
                 // Shared by both gestures: the same screen-to-world inverse
                 // of the transform drawing applies below (translate to
-                // center + pan, then scale), so tap and long-press can
+                // center + pan, then scale), so tap and double-tap can
                 // never disagree about which node they landed on.
                 fun hitTest(screenOffset: Offset): VisibleNode? {
-                    val centerX = size.width / 2f + offset.x
-                    val centerY = size.height / 2f + offset.y
-                    val worldX = (screenOffset.x - centerX) / scale
-                    val worldY = (screenOffset.y - centerY) / scale
-                    return visible.lastOrNull { it.rect.contains(Offset(worldX, worldY)) }
+                    val world = worldPoint(screenOffset, size)
+                    return visible.lastOrNull { it.rect.contains(world) }
                 }
                 detectTapGestures(
                     onTap = { tapOffset ->
@@ -557,8 +588,58 @@ private fun MindMapCanvas(
                             onToggle(hit.node.id)
                         }
                     },
-                    onLongPress = { pressOffset ->
-                        hitTest(pressOffset)?.let { onLongPress(it.node) }
+                    onDoubleTap = { tapOffset ->
+                        hitTest(tapOffset)?.let { onOpenActions(it.node) }
+                    },
+                )
+            }
+            .pointerInput(visible, scale, offset, root) {
+                fun hitTest(screenOffset: Offset): VisibleNode? {
+                    val world = worldPoint(screenOffset, size)
+                    return visible.lastOrNull { it.rect.contains(world) }
+                }
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { startOffset ->
+                        val hit = hitTest(startOffset)
+                        // Root has no parent to move it out of — dragging
+                        // it would have nowhere valid to go.
+                        if (hit != null && hit.node.id != root.id) {
+                            draggingNodeId = hit.node.id
+                            dragScreenDelta = Offset.Zero
+                            dropTargetId = null
+                        }
+                    },
+                    onDrag = { change, dragAmount ->
+                        if (draggingNodeId == null) return@detectDragGesturesAfterLongPress
+                        change.consume()
+                        dragScreenDelta += dragAmount
+                        val draggedRect = visible.first { it.node.id == draggingNodeId }.rect
+                        val draggedCenterNow = draggedRect.center + dragScreenDelta / scale
+                        // A node can't be dropped onto itself or its own
+                        // descendants — computed fresh each drag update
+                        // since which node is "self" doesn't change but
+                        // this is cheap enough not to bother memoizing.
+                        val excluded = mutableSetOf<String>()
+                        visible.first { it.node.id == draggingNodeId }
+                            .let { subtreeIds(it.node, excluded) }
+                        dropTargetId = visible.lastOrNull {
+                            it.node.id !in excluded && it.rect.contains(draggedCenterNow)
+                        }?.node?.id
+                    },
+                    onDragEnd = {
+                        val nodeId = draggingNodeId
+                        val target = dropTargetId
+                        if (nodeId != null && target != null && target != nodeId) {
+                            onReparent(nodeId, target)
+                        }
+                        draggingNodeId = null
+                        dropTargetId = null
+                        dragScreenDelta = Offset.Zero
+                    },
+                    onDragCancel = {
+                        draggingNodeId = null
+                        dropTargetId = null
+                        dragScreenDelta = Offset.Zero
                     },
                 )
             },
@@ -574,7 +655,11 @@ private fun MindMapCanvas(
                     for (v in visible) {
                         val parent = v.hasParent ?: continue
                         val parentCenter = rectById.getValue(parent.id).center
-                        val childCenter = v.rect.center
+                        val childCenter = if (v.node.id == draggingNodeId) {
+                            v.rect.center + dragScreenDelta / scale
+                        } else {
+                            v.rect.center
+                        }
                         drawLine(
                             color = Color(0xFF9575CD),
                             start = parentCenter,
@@ -584,22 +669,44 @@ private fun MindMapCanvas(
                     }
                     for (v in visible) {
                         val isRoot = v.hasParent == null
+                        val isDragging = v.node.id == draggingNodeId
+                        val isDropTarget = v.node.id == dropTargetId
+                        // The dragged box visually follows the finger;
+                        // everything else stays put until drop.
+                        val drawRect = if (isDragging) {
+                            v.rect.translate(dragScreenDelta / scale)
+                        } else {
+                            v.rect
+                        }
                         val fill = v.node.fillColor
                             ?: (if (isRoot) Color(0xFF673AB7) else Color(0xFFEDE7F6))
                         drawRoundRect(
                             color = fill,
-                            topLeft = v.rect.topLeft,
-                            size = v.rect.size,
+                            topLeft = drawRect.topLeft,
+                            size = drawRect.size,
                             cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f),
+                            alpha = if (isDragging) 0.85f else 1f,
                         )
                         val border = v.node.borderColor
                         if (border != null) {
                             drawRoundRect(
                                 color = border,
-                                topLeft = v.rect.topLeft,
-                                size = v.rect.size,
+                                topLeft = drawRect.topLeft,
+                                size = drawRect.size,
                                 cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f),
                                 style = androidx.compose.ui.graphics.drawscope.Stroke(width = 3f / scale),
+                            )
+                        }
+                        // A valid drop target gets its own highlight ring
+                        // regardless of its own border color, so it reads
+                        // clearly even on a node with no border set.
+                        if (isDropTarget) {
+                            drawRoundRect(
+                                color = Color(0xFF2E7D32),
+                                topLeft = drawRect.topLeft,
+                                size = drawRect.size,
+                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(12f, 12f),
+                                style = androidx.compose.ui.graphics.drawscope.Stroke(width = 4f / scale),
                             )
                         }
                         // White text reads on both the purple root default
@@ -612,8 +719,8 @@ private fun MindMapCanvas(
                             textMeasurer = textMeasurer,
                             text = v.node.text,
                             topLeft = Offset(
-                                v.rect.left + NODE_PADDING_H,
-                                v.rect.top + NODE_PADDING_V,
+                                drawRect.left + NODE_PADDING_H,
+                                drawRect.top + NODE_PADDING_V,
                             ),
                             style = textStyle.copy(color = textColor),
                         )

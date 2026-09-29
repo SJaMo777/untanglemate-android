@@ -18,7 +18,26 @@ parent and child, pan (drag), pinch-zoom (wired up, not yet interactively
 verified — see below), and tap-to-expand/collapse a node with children
 (UI-only state — doesn't touch the model's own `collapsed` field).
 
-**Long-press a node** opens a "Node" dialog with everything editing
+**Gestures, and why they ended up split this way**: single tap toggles
+expand/collapse; **double-tap** opens the "Node" dialog below (moved off
+long-press to make room for press-and-drag); **long-press then drag a
+node onto another** reparents it live via `ReparentNodeCommand`, with the
+dragged box following the finger (85% alpha) and the current drop target
+outlined in green, exactly like the tap-a-target "Move to…" dialog below
+but as a direct manipulation. Both ways to reparent are kept — the picker
+is easier for far-apart nodes on a big map, the drag is faster for
+neighbors. Getting drag right meant the pan gesture (`detectTransformGestures`,
+a SEPARATE `pointerInput`) had to explicitly back off while a node-drag is
+in progress (`if (draggingNodeId == null)` guards its own pan/zoom update) —
+without that, a touch starting on a node panned the whole canvas out from
+under it at the same time it was being dragged. Verified on-device with
+`adb shell input draganddrop` specifically (not `input swipe`, which moves
+immediately and never triggers a proper long-press-then-drag) — dragging
+one existing node onto another live on the emulator, confirmed via
+screenshots at each step and a save + reload through the unmodified
+Windows `document.load()`.
+
+**Double-tap a node** opens a "Node" dialog with everything else editing
 needs, all through real `core.commands.*` objects via `core.history.
 History` (module state in `android_bridge._history`) — undo-capable,
 exactly like Windows's own edits, never a raw `node.text = ...`-style
@@ -32,15 +51,11 @@ mutation:
   commands.py but isn't used here: undo is the only way back since there's
   no trash-management UI on Android yet, same as it would be without a
   trash view at all.
-- **Move to…** (`ReparentNodeCommand`, hidden for root) — opens a second
-  dialog: a plain tappable list of every OTHER node (self and its own
-  descendants excluded client-side before ever calling Python). This is
-  deliberately NOT drag-and-drop: a free-drag gesture on this canvas would
-  need to steal single-finger touches away from pan (which already owns
-  them) based on where the touch started, solvable only with hand-rolled
-  low-level pointer handling that's hard to verify without real multi-
-  touch hardware. A tap-a-target list gets the exact same real command
-  with far less risk of a subtly-wrong gesture.
+- **Move to…** (`ReparentNodeCommand`, hidden for root) — a second dialog:
+  a plain tappable list of every OTHER node (self and its own descendants
+  excluded client-side before ever calling Python). The picker alternative
+  to the drag gesture above, for when the target isn't visible on screen
+  right now.
 - **Preset color swatches** (`SetFillColorCommand`) plus a "×" to clear
   back to the theme default (`null`) — real node styling, not just a
   Kotlin-side highlight.
@@ -305,9 +320,11 @@ not found" errors) — use `android.exe` directly, not the wrapper.
   a default).
 - Expand/collapse is still UI-only (doesn't touch the model's real
   `collapsed` field).
-- Move is a tap-a-target picker, not drag-and-drop — see the "Move to…"
-  paragraph above for why that was a deliberate scope decision, not a
-  missing feature.
+- Drag-to-reparent only reparents — no reordering among a node's existing
+  siblings (dropping onto a sibling makes it a CHILD of that sibling, not
+  "move next to it"), and no visual affordance distinguishing "not over a
+  valid target" from "over a valid target" beyond the green outline only
+  appearing on a genuine hit.
 - Node styling covers fill color only (6 presets + clear) — no border
   color UI (the bridge's `set_border_color()` exists and works, just
   nothing in Kotlin calls it yet), no images, no badges. Every custom
