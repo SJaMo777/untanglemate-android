@@ -7,6 +7,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.clickable
@@ -46,10 +48,14 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.isSecondaryPressed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.chaquo.python.PyObject
@@ -57,6 +63,7 @@ import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
 import org.json.JSONObject
 import java.io.File
+import kotlin.math.roundToInt
 
 /** One node in the tree, as parsed from android_bridge's JSON. x/y come
  * from the exact same core.layout algorithm Windows uses (see the bridge
@@ -351,6 +358,21 @@ class MainActivity : ComponentActivity() {
                                     bridge.callAttr("reparent_node", nodeId, newParentId).toString()
                                 )
                             },
+                            // Right-click (mouse secondary button) context
+                            // menu — quick versions of the same actions the
+                            // full "Node" dialog offers, for anyone with a
+                            // mouse/trackpad attached (Chromebook, DeX, a
+                            // tablet with a mouse) rather than only touch.
+                            onQuickAddChild = { node ->
+                                val json = JSONObject(
+                                    bridge.callAttr("add_child", node.id, "New Node").toString()
+                                )
+                                applyMutation(json.toString())
+                            },
+                            onQuickDelete = { node ->
+                                applyMutation(bridge.callAttr("delete_node", node.id).toString())
+                            },
+                            onMoveRequest = { node -> moveTarget = node },
                         )
                     }
                 }
@@ -560,6 +582,9 @@ private fun MindMapCanvas(
     // gesture start, so one of them had to move).
     onOpenActions: (MapNode) -> Unit,
     onReparent: (nodeId: String, newParentId: String) -> Unit,
+    onQuickAddChild: (MapNode) -> Unit,
+    onQuickDelete: (MapNode) -> Unit,
+    onMoveRequest: (MapNode) -> Unit,
 ) {
     val textStyle = canvasTextStyle
 
@@ -573,6 +598,13 @@ private fun MindMapCanvas(
     var draggingNodeId by remember { mutableStateOf<String?>(null) }
     var dragScreenDelta by remember { mutableStateOf(Offset.Zero) }
     var dropTargetId by remember { mutableStateOf<String?>(null) }
+
+    // Right-click context menu state. contextMenuNode == null && contextMenuOpen
+    // means "right-clicked empty space" (a menu with canvas-level actions);
+    // contextMenuNode != null means "right-clicked this node".
+    var contextMenuOpen by remember { mutableStateOf(false) }
+    var contextMenuNode by remember { mutableStateOf<MapNode?>(null) }
+    var contextMenuScreenPos by remember { mutableStateOf(Offset.Zero) }
 
     val visible = remember(root, expanded) {
         val out = mutableListOf<VisibleNode>()
@@ -593,6 +625,32 @@ private fun MindMapCanvas(
     Box(
         modifier = Modifier
             .fillMaxSize()
+            // Mouse right-click (Chromebook / DeX / a tablet with a mouse
+            // attached — Android has supported this for years, it's just
+            // rarely used from touch-only devices). Placed FIRST in the
+            // modifier chain so it sees the Initial pass before the pan/
+            // zoom, tap, and drag detectors below get the Main pass; on a
+            // right-click it consumes the down change, which makes their
+            // requireUnconsumed-by-default awaitFirstDown() ignore it —
+            // touch input never sets isSecondaryPressed, so this never
+            // affects an actual finger tap/drag/pinch, only a real mouse's
+            // right button.
+            .pointerInput(visible, scale, offset) {
+                fun hitTest(screenOffset: Offset): VisibleNode? {
+                    val world = worldPoint(screenOffset, size)
+                    return visible.lastOrNull { it.rect.contains(world) }
+                }
+                awaitEachGesture {
+                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                    if (event.type == PointerEventType.Press && event.buttons.isSecondaryPressed) {
+                        val position = event.changes.first().position
+                        contextMenuNode = hitTest(position)?.node
+                        contextMenuScreenPos = position
+                        contextMenuOpen = true
+                        event.changes.forEach { it.consume() }
+                    }
+                }
+            }
             .pointerInput(Unit) {
                 detectTransformGestures { _, pan, zoom, _ ->
                     // Only pans/zooms empty space — a touch that starts on
@@ -757,6 +815,53 @@ private fun MindMapCanvas(
                                 drawRect.top + NODE_PADDING_V,
                             ),
                             style = textStyle.copy(color = textColor),
+                        )
+                    }
+                }
+            }
+        }
+
+        // The right-click context menu itself. Anchored to a zero-size Box
+        // positioned at the exact screen point the click happened, rather
+        // than at a node's own layout position — a right-click on empty
+        // space has no node to anchor to, and this way both cases (hit a
+        // node vs. hit nothing) share one anchor strategy.
+        if (contextMenuOpen) {
+            Box(
+                modifier = Modifier.offset {
+                    IntOffset(contextMenuScreenPos.x.roundToInt(), contextMenuScreenPos.y.roundToInt())
+                },
+            ) {
+                DropdownMenu(
+                    expanded = true,
+                    onDismissRequest = { contextMenuOpen = false },
+                ) {
+                    val node = contextMenuNode
+                    if (node != null) {
+                        DropdownMenuItem(
+                            text = { Text("Add Child") },
+                            onClick = { contextMenuOpen = false; onQuickAddChild(node) },
+                        )
+                        if (node.id != root.id) {
+                            DropdownMenuItem(
+                                text = { Text("Move to…") },
+                                onClick = { contextMenuOpen = false; onMoveRequest(node) },
+                            )
+                            DropdownMenuItem(
+                                text = { Text("Delete", color = MaterialTheme.colorScheme.error) },
+                                onClick = { contextMenuOpen = false; onQuickDelete(node) },
+                            )
+                        }
+                        DropdownMenuItem(
+                            text = { Text("Rename / Style…") },
+                            onClick = { contextMenuOpen = false; onOpenActions(node) },
+                        )
+                    } else {
+                        // Right-clicked empty space — the one canvas-level
+                        // action that makes sense without a target node.
+                        DropdownMenuItem(
+                            text = { Text("Add Child to Root") },
+                            onClick = { contextMenuOpen = false; onQuickAddChild(root) },
                         )
                     }
                 }
