@@ -9,6 +9,25 @@ Returns plain JSON strings rather than raw Node objects because walking
 a PyObject tree attribute-by-attribute from Kotlin (one Chaquopy call per
 field per node) is chatty and slow for anything but a tiny map; one JSON
 string crossing the bridge is a single call regardless of map size.
+
+Layout is a TWO-STEP handshake, not one call, because good positions need
+REAL text measurements and only Kotlin/Compose can measure text — the
+same reason Windows's own canvas feeds real font-metric sizes into
+`mind_map._layout_measured_sizes` (see layout.py's own comment on it)
+rather than trusting its pure-Python, no-font-metrics width estimate.
+Skipping this step and trusting the bare estimate is exactly what caused
+visible box overlap on a wider real map during testing — the estimate
+runs low for ordinary Latin text by design (layout.py's own words), and
+Android's rendered font/padding never matches it closely enough to skip
+this step and still look right:
+    1. `open_map_structure(path)` / `new_map_structure()` — loads/creates
+       the map (kept as module state in `_current`) and returns text/
+       children only, x/y always 0.0 (not laid out yet).
+    2. Kotlin measures each node's actual on-screen box size and calls
+       `apply_measured_layout(sizes_json)` with `{node_id: [w, h]}`,
+       which feeds those into `_current._layout_measured_sizes`, runs
+       the real `layout.apply_layout`, and returns the full tree with
+       real x/y this time.
 """
 from __future__ import annotations
 
@@ -17,21 +36,14 @@ import json
 from synmind.core import document, layout
 from synmind.core.model import MindMap, Node
 
+_current: MindMap | None = None
+
 
 def _node_to_dict(node: Node) -> dict:
     return {
         "id": node.id,
         "text": node.text,
         "collapsed": node.collapsed,
-        # Positions from the SAME layout algorithm Windows uses
-        # (mind_map.layout_style, default "tidy_branched" — root at
-        # (0, 0), branches fanning to both +x and -x, not a top-down
-        # tree). layout.py is Qt-free and estimates text width itself
-        # when no real font-metrics measurement is available (see its
-        # own "Qt-free" comment), which is exactly the Android case —
-        # positions will be close to Windows's but not pixel-identical,
-        # since Compose measures the actual rendered text separately
-        # for box sizing rather than trusting this estimate.
         "x": node.x,
         "y": node.y,
         "children": [_node_to_dict(c) for c in node.children],
@@ -39,20 +51,44 @@ def _node_to_dict(node: Node) -> dict:
 
 
 def _map_to_json(mind_map: MindMap) -> str:
-    layout.apply_layout(mind_map)
     return json.dumps({
         "title": mind_map.title,
         "root": _node_to_dict(mind_map.root),
     })
 
 
-def new_map_as_json() -> str:
-    """A fresh, empty map — what the app shows before anything is opened."""
-    return _map_to_json(MindMap())
+def new_map_structure() -> str:
+    """A fresh, empty map — what the app shows before anything is opened.
+    Not laid out yet; call apply_measured_layout() next."""
+    global _current
+    _current = MindMap()
+    return _map_to_json(_current)
 
 
-def load_map_as_json(path: str) -> str:
+def open_map_structure(path: str) -> str:
     """Load a real .smmap file (already copied to a local path — Chaquopy/
-    core.document need a real filesystem path, not a content:// URI) and
-    return it in the same shape as new_map_as_json()."""
-    return _map_to_json(document.load(path))
+    core.document need a real filesystem path, not a content:// URI).
+    Not laid out yet; call apply_measured_layout() next."""
+    global _current
+    _current = document.load(path)
+    return _map_to_json(_current)
+
+
+def apply_measured_layout(sizes_json: str) -> str:
+    """sizes_json: {node_id: [width, height], ...} from Kotlin's actual
+    Compose text measurement (box size, padding included — the real
+    on-screen footprint, not just the bare text glyphs) for every node
+    returned by the most recent *_structure() call. Runs the real
+    `core.layout.apply_layout` (mind_map.layout_style, "tidy_branched" by
+    default) with those as the authoritative sizes and returns the same
+    shape as *_structure() but with real x/y this time."""
+    if _current is None:
+        raise RuntimeError(
+            "apply_measured_layout called before new_map_structure/"
+            "open_map_structure")
+    sizes = json.loads(sizes_json)
+    _current._layout_measured_sizes = {
+        node_id: (float(wh[0]), float(wh[1])) for node_id, wh in sizes.items()
+    }
+    layout.apply_layout(_current)
+    return _map_to_json(_current)

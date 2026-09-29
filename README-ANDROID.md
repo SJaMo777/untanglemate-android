@@ -14,24 +14,45 @@ files copied unmodified from the Windows repo (`untanglemate-windows`).
 nodes as boxes positioned by the exact same `core.layout.apply_layout()`
 Windows uses (root at `(0,0)`, branches fanning to both `+x`/`-x` for the
 default "tidy_branched" style, not a top-down tree), connector lines
-between parent and child, pan (drag) and tap-to-expand/collapse a node
+between parent and child, pan (drag), pinch-zoom (wired up, not yet
+interactively verified — see below), and tap-to-expand/collapse a node
 with children (UI-only state — doesn't touch the model's own `collapsed`
-field yet, no editing). Box sizes come from Compose's OWN text
-measurement rather than `layout.py`'s internal Qt-free size estimate, so
-positions are close to Windows's but not pixel-identical — occasional
-overlap on long text is expected at this stage, not a bug to chase yet.
-Two ways to get a map into it:
+field yet, no editing).
+
+Getting a map's layout right needed a TWO-STEP handshake with
+`android_bridge.py`, not one call — see that module's own comment for
+the full reasoning:
+1. `new_map_structure()` / `open_map_structure(path)` loads/creates the
+   map and returns text + children only, positions not set yet.
+2. Kotlin measures each node's REAL on-screen box size via Compose's
+   `TextMeasurer` and calls `apply_measured_layout(sizes_json)`, which
+   feeds those into `mind_map._layout_measured_sizes` — the exact
+   mechanism Windows's own canvas uses for real font-metric sizes — then
+   runs the real `layout.apply_layout` and returns the laid-out tree.
+
+Trusting `layout.py`'s bare Qt-free size estimate instead (skipping step
+2) was the FIRST thing tried, and it visibly overlapped boxes on a wider
+real map — the estimate runs low for ordinary Latin text by design (see
+`layout.py`'s own comment on it). Two ways to get a map into it:
 - **"Open .smmap…"** — the real feature. Uses Android's Storage Access
   Framework (`ActivityResultContracts.OpenDocument`) to pick a file, copies
   it into the app's cache dir (Chaquopy/`core.document.load()` needs a real
-  filesystem path, not a `content://` URI), then loads it through
-  `synmind.android_bridge.load_map_as_json` — which calls the exact same
+  filesystem path, not a `content://` URI), then runs the two-step load
+  above through `synmind.android_bridge` — which calls the exact same
   `core.document.load()` / `core.file_format` Windows uses, Fernet
   decryption included.
 - **"Load test map"** — debug-only (`BuildConfig.DEBUG`), reads a fixed
   path from the app's own external files dir. Exists purely so this could
   be verified end to end via `adb` without scripting the system file
   picker's UI.
+
+**Known issue, tracked separately, NOT fixed here**: even with real
+measured sizes fed in correctly, `layout.py` can still place an immediate
+child of the root close enough to overlap the root's own box — confirmed
+reproducible on plain Windows Python, not Android-specific, so it's a
+real gap in the shared algorithm's root-adjacent spacing, not something
+to patch around in this app. See the todo tagged `core-logic`/`layout`.
+Deeper levels (grandchildren etc.) spaced correctly in the same test.
 
 Verified on a real emulator (not just compiled): loaded an actual
 encrypted `.smmap` (root + 2 children + 1 grandchild), title and full tree

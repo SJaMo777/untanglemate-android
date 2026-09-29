@@ -79,9 +79,33 @@ class MainActivity : ComponentActivity() {
         bridge = Python.getInstance().getModule("synmind.android_bridge")
 
         setContent {
+            val textMeasurer = rememberTextMeasurer()
+
+            // Two-step handshake with android_bridge (see its own big
+            // comment on why): get the raw structure, measure each
+            // node's REAL box size ourselves, feed that back for
+            // layout.py to actually use instead of its own low-for-
+            // Latin-text estimate, then parse the properly laid-out
+            // result. Skipping the measure step is what caused visible
+            // box overlap on a wider real map during testing.
+            fun applyStructureAndLayout(structureJson: String): MapNode {
+                val structureRoot = parseNode(JSONObject(structureJson).getJSONObject("root"))
+                val sizes = org.json.JSONObject()
+                fun walk(n: MapNode) {
+                    val measured = textMeasurer.measure(n.text, canvasTextStyle)
+                    val w = measured.size.width + NODE_PADDING_H * 2
+                    val h = measured.size.height + NODE_PADDING_V * 2
+                    sizes.put(n.id, org.json.JSONArray(listOf(w.toDouble(), h.toDouble())))
+                    n.children.forEach { walk(it) }
+                }
+                walk(structureRoot)
+                val positioned = bridge.callAttr("apply_measured_layout", sizes.toString()).toString()
+                return parseNode(JSONObject(positioned).getJSONObject("root"))
+            }
+
             var title by remember { mutableStateOf("Untitled") }
             var root by remember {
-                mutableStateOf(parseNode(JSONObject(bridge.callAttr("new_map_as_json").toString()).getJSONObject("root")))
+                mutableStateOf(applyStructureAndLayout(bridge.callAttr("new_map_structure").toString()))
             }
             // Expand/collapse is UI-only for now — does not touch the
             // model's own `collapsed` field (see README-ANDROID.md: not
@@ -89,9 +113,12 @@ class MainActivity : ComponentActivity() {
             val expanded = remember { mutableStateOf(setOf(root.id)) }
 
             fun loadFromPath(path: String) {
-                val json = JSONObject(bridge.callAttr("load_map_as_json", path).toString())
-                title = json.getString("title")
-                root = parseNode(json.getJSONObject("root"))
+                val structureJson = bridge.callAttr("open_map_structure", path).toString()
+                // Title doesn't need measuring — read it straight off the
+                // structure call rather than round-tripping it through
+                // apply_measured_layout too.
+                title = JSONObject(structureJson).getString("title")
+                root = applyStructureAndLayout(structureJson)
                 expanded.value = setOf(root.id)
             }
 
@@ -143,6 +170,7 @@ class MainActivity : ComponentActivity() {
                         MindMapCanvas(
                             root = root,
                             expanded = expanded.value,
+                            textMeasurer = textMeasurer,
                             onToggle = { id ->
                                 expanded.value = if (id in expanded.value) {
                                     expanded.value - id
@@ -162,6 +190,7 @@ private data class VisibleNode(val node: MapNode, val hasParent: MapNode?, val r
 
 private const val NODE_PADDING_H = 24f
 private const val NODE_PADDING_V = 16f
+private val canvasTextStyle = TextStyle(fontSize = 14.sp, color = Color.Black)
 
 /** Flattens the tree into world-space boxes, skipping subtrees under a
  * collapsed node. Shared by drawing AND tap hit-testing so they can never
@@ -191,10 +220,10 @@ private fun computeVisible(
 private fun MindMapCanvas(
     root: MapNode,
     expanded: Set<String>,
+    textMeasurer: androidx.compose.ui.text.TextMeasurer,
     onToggle: (String) -> Unit,
 ) {
-    val textMeasurer = rememberTextMeasurer()
-    val textStyle = TextStyle(fontSize = 14.sp, color = Color.Black)
+    val textStyle = canvasTextStyle
 
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
