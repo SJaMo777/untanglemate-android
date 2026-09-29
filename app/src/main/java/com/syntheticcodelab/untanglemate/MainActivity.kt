@@ -624,6 +624,14 @@ class MainActivity : ComponentActivity() {
                                 if (selectedNodeId == node.id) selectedNodeId = null
                             },
                             onMoveRequest = { node -> moveTarget = node },
+                            onToggleTodo = { node ->
+                                applyMutation(
+                                    bridge.callAttr(
+                                        "set_todo", node.id, !node.todoMarked, node.todoDueAt,
+                                    ).toString()
+                                )
+                            },
+                            onSetDueDate = { node -> dueDateTarget = node },
                             // Hoisted so the header's Edit menu (outside the
                             // canvas) can see and act on the same selection
                             // a tap sets.
@@ -983,6 +991,8 @@ private fun MindMapCanvas(
     onQuickAddChild: (MapNode) -> Unit,
     onQuickDelete: (MapNode) -> Unit,
     onMoveRequest: (MapNode) -> Unit,
+    onToggleTodo: (MapNode) -> Unit,
+    onSetDueDate: (MapNode) -> Unit,
     selectedNodeId: String?,
     onSelect: (String?) -> Unit,
 ) {
@@ -1317,6 +1327,22 @@ private fun MindMapCanvas(
                         DropdownMenuItem(
                             text = { Text("Rename / Style…") },
                             onClick = { contextMenuOpen = false; onOpenActions(node) },
+                        )
+                        HorizontalDivider()
+                        // Matches Windows's own node right-click menu,
+                        // which has a "Mark as ToDo" / "Unmark as ToDo"
+                        // toggle plus a due-date item in its ToDo/Schedule
+                        // submenus (see node_item.py's
+                        // _show_node_context_menu_impl) — this was the one
+                        // node action reachable from the Edit menu and
+                        // toolbar but missing from here.
+                        DropdownMenuItem(
+                            text = { Text(if (node.todoMarked) "Unmark as ToDo" else "Mark as ToDo") },
+                            onClick = { contextMenuOpen = false; onToggleTodo(node) },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Set Due Date…") },
+                            onClick = { contextMenuOpen = false; onSetDueDate(node) },
                         )
                     } else {
                         // Right-clicked empty space — the one canvas-level
