@@ -175,6 +175,24 @@ private val PRESET_COLORS = listOf(
     "#EF5350", "#FFA726", "#FFEE58", "#66BB6A", "#42A5F5", "#AB47BC",
 )
 
+// Where "reopen the last map on launch" remembers what that was —
+// matches Windows's own _maybe_open_last_file()/run_deferred_startup_open(),
+// just via SharedPreferences instead of QSettings. At most one is set,
+// same "at most one of currentUri/currentDebugPath" rule the rest of the
+// app already follows.
+private const val PREFS_NAME = "untanglemate_prefs"
+private const val PREF_LAST_URI = "last_uri"
+private const val PREF_LAST_DEBUG_PATH = "last_debug_path"
+
+/** What onCreate's first composition loads: either the persisted last
+ * map (if it's still reachable) or a fresh one. */
+private data class StartupLoad(
+    val title: String,
+    val root: MapNode,
+    val uri: Uri?,
+    val debugPath: String?,
+)
+
 class MainActivity : ComponentActivity() {
     private lateinit var bridge: PyObject
 
@@ -212,10 +230,44 @@ class MainActivity : ComponentActivity() {
                 return parseNode(JSONObject(positioned).getJSONObject("root"))
             }
 
-            var title by remember { mutableStateOf("Untitled") }
-            var root by remember {
-                mutableStateOf(applyStructureAndLayout(bridge.callAttr("new_map_structure").toString()))
+            // Reopen the last map on launch, same idea as Windows's
+            // _maybe_open_last_file() — try the persisted URI/path first,
+            // and only fall back to a fresh map if nothing was saved or
+            // the file/permission is no longer reachable (moved, deleted,
+            // permission revoked).
+            val startupLoad = remember {
+                val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                val savedDebugPath = prefs.getString(PREF_LAST_DEBUG_PATH, null)
+                val savedUriString = prefs.getString(PREF_LAST_URI, null)
+                val reopened: StartupLoad? = when {
+                    savedDebugPath != null && File(savedDebugPath).exists() -> runCatching {
+                        val json = bridge.callAttr("open_map_structure", savedDebugPath).toString()
+                        StartupLoad(
+                            JSONObject(json).getString("title"),
+                            applyStructureAndLayout(json),
+                            null,
+                            savedDebugPath,
+                        )
+                    }.getOrNull()
+                    savedUriString != null -> runCatching {
+                        val uri = Uri.parse(savedUriString)
+                        val local = File(cacheDir, "opened.smmap")
+                        contentResolver.openInputStream(uri)!!.use { input ->
+                            local.outputStream().use { output -> input.copyTo(output) }
+                        }
+                        val json = bridge.callAttr("open_map_structure", local.absolutePath).toString()
+                        StartupLoad(JSONObject(json).getString("title"), applyStructureAndLayout(json), uri, null)
+                    }.getOrNull()
+                    else -> null
+                }
+                reopened ?: run {
+                    val json = bridge.callAttr("new_map_structure").toString()
+                    StartupLoad(JSONObject(json).getString("title"), applyStructureAndLayout(json), null, null)
+                }
             }
+
+            var title by remember { mutableStateOf(startupLoad.title) }
+            var root by remember { mutableStateOf(startupLoad.root) }
             // Expand/collapse is UI-only for now — does not touch the
             // model's own `collapsed` field.
             val expanded = remember { mutableStateOf(setOf(root.id)) }
@@ -227,8 +279,8 @@ class MainActivity : ComponentActivity() {
             // already has a real filesystem path with nothing to resolve.
             // Neither set (a fresh, never-opened map) means Save must
             // fall back to Save As.
-            var currentUri by remember { mutableStateOf<Uri?>(null) }
-            var currentDebugPath by remember { mutableStateOf<String?>(null) }
+            var currentUri by remember { mutableStateOf(startupLoad.uri) }
+            var currentDebugPath by remember { mutableStateOf(startupLoad.debugPath) }
             var actionTarget by remember { mutableStateOf<MapNode?>(null) }
             var moveTarget by remember { mutableStateOf<MapNode?>(null) }
             var dueDateTarget by remember { mutableStateOf<MapNode?>(null) }
@@ -274,6 +326,27 @@ class MainActivity : ComponentActivity() {
                 refreshEditorFlags()
             }
 
+            // Remembers what to reopen next launch (see startupLoad above).
+            // A content:// URI only survives a process restart if its
+            // permission grant is made persistable — without this call,
+            // reading it back in a fresh startupLoad throws
+            // SecurityException instead of just failing quietly.
+            fun persistLastOpened(uri: Uri?, debugPath: String?) {
+                if (uri != null) {
+                    runCatching {
+                        contentResolver.takePersistableUriPermission(
+                            uri,
+                            android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                        )
+                    }
+                }
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putString(PREF_LAST_URI, uri?.toString())
+                    .putString(PREF_LAST_DEBUG_PATH, debugPath)
+                    .apply()
+            }
+
             val openDocument = rememberLauncherForActivityResult(
                 ActivityResultContracts.OpenDocument()
             ) { uri: Uri? ->
@@ -288,6 +361,7 @@ class MainActivity : ComponentActivity() {
                 loadFromPath(local.absolutePath)
                 currentUri = uri
                 currentDebugPath = null
+                persistLastOpened(uri, null)
             }
 
             fun writeSaveTo(uri: Uri) {
@@ -306,6 +380,7 @@ class MainActivity : ComponentActivity() {
                 currentUri = uri
                 currentDebugPath = null
                 refreshEditorFlags()
+                persistLastOpened(uri, null)
             }
 
             fun saveCurrentMap() {
@@ -406,6 +481,7 @@ class MainActivity : ComponentActivity() {
                                                     loadFromPath(f.absolutePath)
                                                     currentDebugPath = f.absolutePath
                                                     currentUri = null
+                                                    persistLastOpened(null, f.absolutePath)
                                                 },
                                             )
                                         }
